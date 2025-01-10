@@ -3,11 +3,8 @@
 
 
 # Python imports
-import io
-import os
 
 # Django imports
-from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 
 # Datatracker imports
@@ -15,34 +12,13 @@ from ietf.group.models import Group
 from ietf.ietfauth.utils import has_role
 
 
-
-
-def current_nomcom():
-    qs = Group.objects.filter(acronym__startswith='nomcom',state__slug="active").order_by('-time')
-    if qs.count():
-        return qs[0]
-    else:
-        return None
-
-def get_charter_text(group):
-    '''
-    Takes a group object and returns the text or the group's charter as a string
-    '''
-    charter = group.charter
-    path = os.path.join(settings.CHARTER_PATH, '%s-%s.txt' % (charter.canonical_name(), charter.rev))
-    f = io.open(path,'r')
-    text = f.read()
-    f.close()
-
-    return text
-
 def get_my_groups(user,conclude=False):
     '''
     Takes a Django user object (from request)
     Returns a list of groups the user has access to.  Rules are as follows
     secretariat - has access to all groups
     area director - has access to all groups in their area
-    wg chair or secretary - has acceses to their own group
+    wg chair or secretary - has access to their own group
     chair of irtf has access to all irtf groups
 
     If user=None than all groups are returned.

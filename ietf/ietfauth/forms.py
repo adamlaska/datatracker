@@ -6,20 +6,17 @@ import re
 from unidecode import unidecode
 
 from django import forms
-from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.auth.models import User
-from django.utils.html import mark_safe # type:ignore
-from django.urls import reverse as urlreverse
-
-from django_password_strength.widgets import PasswordStrengthInput, PasswordConfirmationInput
-
-import debug                            # pyflakes:ignore
 
 from ietf.person.models import Person, Email
-from ietf.mailinglists.models import Whitelisted
+from ietf.mailinglists.models import Allowlisted
 from ietf.utils.text import isascii
+
+from .validators import prevent_at_symbol, prevent_system_name, prevent_anonymous_name, is_allowed_address
+from .widgets import PasswordStrengthInput, PasswordConfirmationInput
+
 
 class RegistrationForm(forms.Form):
     email = forms.EmailField(label="Your email (lowercase)")
@@ -30,8 +27,6 @@ class RegistrationForm(forms.Form):
             return email
         if email.lower() != email:
             raise forms.ValidationError('The supplied address contained uppercase letters.  Please use a lowercase email address.')
-        if User.objects.filter(username=email).exists():
-            raise forms.ValidationError('An account with the email address you provided already exists.')
         return email
 
 
@@ -56,19 +51,6 @@ def ascii_cleaner(supposedly_ascii):
         raise forms.ValidationError("Only unaccented Latin characters are allowed.")
     return supposedly_ascii
 
-def prevent_at_symbol(name):
-    if "@" in name:
-        raise forms.ValidationError("Please fill in name - this looks like an email address (@ is not allowed in names).")
-
-def prevent_system_name(name):
-    name_without_spaces = name.replace(" ", "").replace("\t", "")
-    if "(system)" in name_without_spaces.lower():
-        raise forms.ValidationError("Please pick another name - this name is reserved.")
-
-def prevent_anonymous_name(name):
-    name_without_spaces = name.replace(" ", "").replace("\t", "")
-    if "anonymous" in name_without_spaces.lower():
-        raise forms.ValidationError("Please pick another name - this name is reserved.")
 
 class PersonPasswordForm(forms.ModelForm, PasswordForm):
 
@@ -103,10 +85,7 @@ def get_person_form(*args, **kwargs):
     class PersonForm(forms.ModelForm):
         class Meta:
             model = Person
-            exclude = exclude_list
-            widgets = {
-                'consent': forms.widgets.CheckboxInput,
-            }            
+            exclude = exclude_list           
 
         def __init__(self, *args, **kwargs):
             super(PersonForm, self).__init__(*args, **kwargs)
@@ -119,10 +98,9 @@ def get_person_form(*args, **kwargs):
                 self.initial["ascii"] = ""
 
             self.fields['pronouns_selectable'] = forms.MultipleChoiceField(label='Pronouns', choices = [(option, option) for option in ["he/him", "she/her", "they/them"]], widget=forms.CheckboxSelectMultiple, required=False)
-
-            for f in ['name', 'ascii', 'ascii_short', 'biography', 'photo', 'photo_thumb', 'pronouns_selectable']:
-                if f in self.fields:
-                    self.fields[f].label = mark_safe(self.fields[f].label + ' <a href="#pi" aria-label="!"><i class="bi bi-exclamation-circle"></i></a>')
+            self.fields["pronouns_freetext"].widget.attrs.update(
+                {"aria-label": "Optionally provide your personal pronouns"}
+            )
 
             self.unidecoded_ascii = False
 
@@ -155,19 +133,6 @@ def get_person_form(*args, **kwargs):
             prevent_system_name(name)
             return ascii_cleaner(name)
 
-        def clean_consent(self):
-            consent = self.cleaned_data.get('consent')
-            require_consent = (
-                self.cleaned_data.get('name') != person.name_from_draft
-                or self.cleaned_data.get('ascii') != person.name_from_draft
-                or self.cleaned_data.get('biography')
-                or self.cleaned_data.get('pronouns_selectable')
-                or self.cleaned_data.get('pronouns_freetext')
-            )
-            if consent == False and require_consent:
-                raise forms.ValidationError("In order to modify your profile with data that require consent, you must permit the IETF to use the uploaded data.")
-            return consent
-
         def clean(self):
             if self.cleaned_data.get("pronouns_selectable") and self.cleaned_data.get("pronouns_freetext"):
                 self.add_error("pronouns_freetext", "Either select from the pronoun checkboxes or provide a custom value, but not both")
@@ -176,20 +141,7 @@ def get_person_form(*args, **kwargs):
 
 
 class NewEmailForm(forms.Form):
-    new_email = forms.EmailField(label="New email address", required=False)
-
-    def clean_new_email(self):
-        email = self.cleaned_data.get("new_email", "")
-        if email:
-            existing = Email.objects.filter(address=email).first()
-            if existing:
-                raise forms.ValidationError("Email address '%s' is already assigned to account '%s' (%s)" % (existing, existing.person and existing.person.user, existing.person))
-
-        for pat in settings.EXCLUDED_PERSONAL_EMAIL_REGEX_PATTERNS:
-            if re.search(pat, email):
-                raise ValidationError("This email address is not valid in a datatracker account")
-
-        return email
+    new_email = forms.EmailField(label="New email address", required=False, validators=[is_allowed_address])
 
 
 class RoleEmailForm(forms.Form):
@@ -209,20 +161,13 @@ class RoleEmailForm(forms.Form):
 class ResetPasswordForm(forms.Form):
     username = forms.EmailField(label="Your email (lowercase)")
 
-    def clean_username(self):
-        import ietf.ietfauth.views
-        username = self.cleaned_data["username"]
-        if not User.objects.filter(username=username).exists():
-            raise forms.ValidationError(mark_safe("Didn't find a matching account. If you don't have an account yet, you can <a href=\"{}\">create one</a>.".format(urlreverse(ietf.ietfauth.views.create_account))))
-        return username
-
 
 class TestEmailForm(forms.Form):
     email = forms.EmailField(required=False)
 
-class WhitelistForm(forms.ModelForm):
+class AllowlistForm(forms.ModelForm):
     class Meta:
-        model = Whitelisted
+        model = Allowlisted
         exclude = ['by', 'time' ]
 
     
@@ -274,6 +219,6 @@ class ChangeUsernameForm(forms.Form):
 
     def clean_username(self):
         username = self.cleaned_data['username']
-        if User.objects.filter(username=username).exists():
+        if User.objects.filter(username__iexact=username).exists():
             raise ValidationError("A login with that username already exists.  Please contact the secretariat to get this resolved.")
         return username

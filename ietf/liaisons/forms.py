@@ -3,22 +3,21 @@
 
 
 import io
-import datetime, os
+import os
 import operator
 
 from typing import Union            # pyflakes:ignore
 
 from email.utils import parseaddr
-from form_utils.forms import BetterModelForm
 
 from django import forms
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
-from django.db.models.query import QuerySet
 from django.forms.utils import ErrorList
 from django.db.models import Q
 #from django.forms.widgets import RadioFieldRenderer
 from django.core.validators import validate_email
+from django_stubs_ext import QuerySetAny
 
 import debug                            # pyflakes:ignore
 
@@ -32,15 +31,16 @@ from ietf.liaisons.fields import SearchableLiaisonStatementsField
 from ietf.group.models import Group
 from ietf.person.models import Email
 from ietf.person.fields import SearchableEmailField
-from ietf.doc.models import Document, DocAlias
-from ietf.utils.fields import DatepickerDateField
+from ietf.doc.models import Document
+from ietf.utils.fields import DatepickerDateField, ModelMultipleChoiceField
+from ietf.utils.timezone import date_today, datetime_from_date, DEADLINE_TZINFO
 from functools import reduce
 
 '''
 NOTES:
 Authorized individuals are people (in our Person table) who are authorized to send
 messages on behalf of some other group - they have a formal role in the other group,
-whereas the liasion manager has a formal role with the IETF (or more correctly,
+whereas the liaison manager has a formal role with the IETF (or more correctly,
 with the IAB).
 '''
 
@@ -131,7 +131,7 @@ class AddCommentForm(forms.Form):
 #     def render(self):
 #         output = []
 #         for widget in self:
-#             output.append(format_html(force_text(widget)))
+#             output.append(format_html(force_str(widget)))
 #         return mark_safe('\n'.join(output))
 
 
@@ -185,9 +185,12 @@ class SearchLiaisonForm(forms.Form):
             end_date = self.cleaned_data.get('end_date')
             events = None
             if start_date:
-                events = LiaisonStatementEvent.objects.filter(type='posted', time__gte=start_date)
+                events = LiaisonStatementEvent.objects.filter(
+                    type='posted',
+                    time__gte=datetime_from_date(start_date, DEADLINE_TZINFO),
+                )
                 if end_date:
-                    events = events.filter(time__lte=end_date)
+                    events = events.filter(time__lte=datetime_from_date(end_date, DEADLINE_TZINFO))
             elif end_date:
                 events = LiaisonStatementEvent.objects.filter(type='posted', time__lte=end_date)
             if events:
@@ -197,10 +200,10 @@ class SearchLiaisonForm(forms.Form):
         return results
 
 
-class CustomModelMultipleChoiceField(forms.ModelMultipleChoiceField):
+class CustomModelMultipleChoiceField(ModelMultipleChoiceField):
     '''If value is a QuerySet, return it as is (for use in widget.render)'''
     def prepare_value(self, value):
-        if isinstance(value, QuerySet):
+        if isinstance(value, QuerySetAny):
             return value
         if (hasattr(value, '__iter__') and
                 not isinstance(value, str) and
@@ -209,20 +212,20 @@ class CustomModelMultipleChoiceField(forms.ModelMultipleChoiceField):
         return super(CustomModelMultipleChoiceField, self).prepare_value(value)
 
 
-class LiaisonModelForm(BetterModelForm):
+class LiaisonModelForm(forms.ModelForm):
     '''Specify fields which require a custom widget or that are not part of the model.
     '''
-    from_groups = forms.ModelMultipleChoiceField(queryset=Group.objects.all(),label='Groups',required=False)
+    from_groups = ModelMultipleChoiceField(queryset=Group.objects.all(),label='Groups',required=False)
     from_groups.widget.attrs["class"] = "select2-field"
     from_groups.widget.attrs['data-minimum-input-length'] = 0
     from_contact = forms.EmailField()   # type: Union[forms.EmailField, SearchableEmailField]
     to_contacts = forms.CharField(label="Contacts", widget=forms.Textarea(attrs={'rows':'3', }), strip=False)
-    to_groups = forms.ModelMultipleChoiceField(queryset=Group.objects,label='Groups',required=False)
+    to_groups = ModelMultipleChoiceField(queryset=Group.objects,label='Groups',required=False)
     to_groups.widget.attrs["class"] = "select2-field"
     to_groups.widget.attrs['data-minimum-input-length'] = 0
     deadline = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={"autoclose": "1" }, label='Deadline', required=True)
     related_to = SearchableLiaisonStatementsField(label='Related Liaison Statement', required=False)
-    submitted_date = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={"autoclose": "1" }, label='Submission date', required=True, initial=datetime.date.today())
+    submitted_date = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={"autoclose": "1" }, label='Submission date', required=True, initial=lambda: date_today(DEADLINE_TZINFO))
     attachments = CustomModelMultipleChoiceField(queryset=Document.objects,label='Attachments', widget=ShowAttachmentsWidget, required=False)
     attach_title = forms.CharField(label='Title', required=False)
     attach_file = forms.FileField(label='File', required=False)
@@ -234,13 +237,6 @@ class LiaisonModelForm(BetterModelForm):
     class Meta:
         model = LiaisonStatement
         exclude = ('attachments','state','from_name','to_name')
-        fieldsets = [('From', {'fields': ['from_groups','from_contact', 'response_contacts'], 'legend': ''}),
-                     ('To', {'fields': ['to_groups','to_contacts'], 'legend': ''}),
-                     ('Other email addresses', {'fields': ['technical_contacts','action_holder_contacts','cc_contacts'], 'legend': ''}),
-                     ('Purpose', {'fields':['purpose', 'deadline'], 'legend': ''}),
-                     ('Reference', {'fields': ['other_identifiers','related_to'], 'legend': ''}),
-                     ('Liaison Statement', {'fields': ['title', 'submitted_date', 'body', 'attachments'], 'legend': ''}),
-                     ('Add attachment', {'fields': ['attach_title', 'attach_file', 'attach_button'], 'legend': ''})]
 
     def __init__(self, user, *args, **kwargs):
         super(LiaisonModelForm, self).__init__(*args, **kwargs)
@@ -379,8 +375,6 @@ class LiaisonModelForm(BetterModelForm):
                     uploaded_filename = name + extension, 
                     )
                 )
-            if created:
-                DocAlias.objects.create(name=attach.name).docs.add(attach)
             LiaisonStatementAttachment.objects.create(statement=self.instance,document=attach)
             attach_file = io.open(os.path.join(settings.LIAISON_ATTACH_PATH, attach.name + extension), 'wb')
             attach_file.write(attached_file.read())
@@ -467,20 +461,11 @@ class IncomingLiaisonForm(LiaisonModelForm):
 
 
 class OutgoingLiaisonForm(LiaisonModelForm):
-    from_contact = SearchableEmailField(only_users=True)
     approved = forms.BooleanField(label="Obtained prior approval", required=False)
 
     class Meta:
         model = LiaisonStatement
         exclude = ('attachments','state','from_name','to_name','action_holder_contacts')
-        # add approved field, no action_holder_contacts
-        fieldsets = [('From', {'fields': ['from_groups','from_contact','response_contacts','approved'], 'legend': ''}),
-                     ('To', {'fields': ['to_groups','to_contacts'], 'legend': ''}),
-                     ('Other email addresses', {'fields': ['technical_contacts','cc_contacts'], 'legend': ''}),
-                     ('Purpose', {'fields':['purpose', 'deadline'], 'legend': ''}),
-                     ('Reference', {'fields': ['other_identifiers','related_to'], 'legend': ''}),
-                     ('Liaison Statement', {'fields': ['title', 'submitted_date', 'body', 'attachments'], 'legend': ''}),
-                     ('Add attachment', {'fields': ['attach_title', 'attach_file', 'attach_button'], 'legend': ''})]
 
     def is_approved(self):
         return self.cleaned_data['approved']
@@ -497,6 +482,7 @@ class OutgoingLiaisonForm(LiaisonModelForm):
             self.fields['from_groups'].initial = [flat_choices[0][0]]
         
         if has_role(self.user, "Secretariat"):
+            self.fields['from_contact'] = SearchableEmailField(only_users=True)  # secretariat can edit this field!
             return
 
         if self.person.role_set.filter(name='liaiman',group__state='active'):
@@ -505,8 +491,10 @@ class OutgoingLiaisonForm(LiaisonModelForm):
             email = self.person.role_set.filter(name__in=('ad','chair'),group__state='active').first().email.address
         else:
             email = self.person.email_address()
+
+        # Non-secretariat user cannot change the from_contact field. Fill in its value.
+        self.fields['from_contact'].disabled = True
         self.fields['from_contact'].initial = email
-        self.fields['from_contact'].widget.attrs['disabled'] = True
 
     def set_to_fields(self):
         '''Set to_groups and to_contacts options and initial value based on user
@@ -530,15 +518,14 @@ class EditLiaisonForm(LiaisonModelForm):
         super(EditLiaisonForm, self).__init__(*args, **kwargs)
         self.edit = True
         self.fields['attachments'].initial = self.instance.liaisonstatementattachment_set.exclude(removed=True)
-        related = [ str(x.pk) for x in self.instance.source_of_set.all() ]
-        self.fields['related_to'].initial = ','.join(related)
+        self.fields['related_to'].initial = [ x.target for x in self.instance.source_of_set.all() ]
         self.fields['submitted_date'].initial = self.instance.submitted
 
     def save(self, *args, **kwargs):
         super(EditLiaisonForm, self).save(*args,**kwargs)
         if self.has_changed() and 'submitted_date' in self.changed_data:
             event = self.instance.liaisonstatementevent_set.filter(type='submitted').first()
-            event.time = self.cleaned_data.get('submitted_date')
+            event.time = datetime_from_date(self.cleaned_data.get('submitted_date'), DEADLINE_TZINFO)
             event.save()
 
         return self.instance

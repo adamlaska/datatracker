@@ -1,10 +1,12 @@
-# Copyright The IETF Trust 2007-2020, All Rights Reserved
+# Copyright The IETF Trust 2007-2023, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
 import datetime
 import re
+from pathlib import Path
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from django import template
 from django.conf import settings
@@ -12,17 +14,18 @@ from django.utils.html import escape
 from django.template.defaultfilters import truncatewords_html, linebreaksbr, stringfilter, striptags
 from django.utils.safestring import mark_safe, SafeData
 from django.utils.html import strip_tags
-from django.utils.encoding import force_text
-from django.utils.encoding import force_str # pyflakes:ignore force_str is used in the doctests
+from django.utils.encoding import force_str
 from django.urls import reverse as urlreverse
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.urls import NoReverseMatch
+from django.utils import timezone
 
 import debug                            # pyflakes:ignore
 
-from ietf.doc.models import BallotDocEvent, DocAlias
+from ietf.doc.models import BallotDocEvent, Document
 from ietf.doc.models import ConsensusDocEvent
+from ietf.ietfauth.utils import can_request_rfc_publication as utils_can_request_rfc_publication
 from ietf.utils.html import sanitize_fragment
 from ietf.utils import log
 from ietf.doc.utils import prettify_std_name
@@ -129,7 +132,7 @@ register.filter('fill', fill)
 @register.filter
 def prettystdname(string, space=" "):
     from ietf.doc.utils import prettify_std_name
-    return prettify_std_name(force_text(string or ""), space)
+    return prettify_std_name(force_str(string or ""), space)
 
 @register.filter
 def rfceditor_info_url(rfcnum : str):
@@ -137,15 +140,16 @@ def rfceditor_info_url(rfcnum : str):
     return urljoin(settings.RFC_EDITOR_INFO_BASE_URL, f'rfc{rfcnum}')
 
 
-def doc_canonical_name(name):
+def doc_name(name):
     """Check whether a given document exists, and return its canonical name"""
 
     def find_unique(n):
         key = hash(n)
         found = cache.get(key)
         if not found:
-            exact = DocAlias.objects.filter(name=n).first()
+            exact = Document.objects.filter(name=n).first()
             found = exact.name if exact else "_"
+            # TODO review this cache policy (and the need for these entire function)
             cache.set(key, found, timeout=60*60*24)  # cache for one day
         return None if found == "_" else found
 
@@ -171,7 +175,7 @@ def doc_canonical_name(name):
 
 
 def link_charter_doc_match(match):
-    if not doc_canonical_name(match[0]):
+    if not doc_name(match[0]):
         return match[0]
     url = urlreverse(
         "ietf.doc.views_doc.document_main",
@@ -184,7 +188,7 @@ def link_non_charter_doc_match(match):
     name = match[0]
     # handle "I-D.*"" reference-style matches
     name = re.sub(r"^i-d\.(.*)", r"draft-\1", name, flags=re.IGNORECASE)
-    cname = doc_canonical_name(name)
+    cname = doc_name(name)
     if not cname:
         return match[0]
     if name == cname:
@@ -199,7 +203,7 @@ def link_non_charter_doc_match(match):
         url = urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=cname))
         return f'<a href="{url}">{match[0]}</a>'
 
-    cname = doc_canonical_name(name)
+    cname = doc_name(name)
     if not cname:
         return match[0]
     if name == cname:
@@ -219,11 +223,10 @@ def link_non_charter_doc_match(match):
 def link_other_doc_match(match):
     doc = match[2].strip().lower()
     rev = match[3]
-    if not doc_canonical_name(doc + rev):
+    if not doc_name(doc + rev):
         return match[0]
     url = urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=doc + rev))
     return f'<a href="{url}">{match[1]}</a>'
-
 
 @register.filter(name="urlize_ietf_docs", is_safe=True, needs_autoescape=True)
 def urlize_ietf_docs(string, autoescape=None):
@@ -248,33 +251,33 @@ def urlize_ietf_docs(string, autoescape=None):
         flags=re.IGNORECASE | re.ASCII,
     )
     string = re.sub(
-        r"\b(?<![/\-:=#\"\'])((RFC|BCP|STD|FYI)\s*0*(\d+))\b",
+        r"\b(?<![/\-:=#\"\'])((RFC|BCP|STD|FYI) *\n? *0*(\d+))\b",
         link_other_doc_match,
         string,
         flags=re.IGNORECASE | re.ASCII,
     )
+
     return mark_safe(string)
 
 
 urlize_ietf_docs = stringfilter(urlize_ietf_docs)
 
-@register.filter(name='urlize_related_source_list', is_safe=True, needs_autoescape=True)
-def urlize_related_source_list(related, autoescape=None):
+@register.filter(name='urlize_related_source_list', is_safe=True, document_html=False)
+def urlize_related_source_list(related, document_html=False):
     """Convert a list of RelatedDocuments into list of links using the source document's canonical name"""
     links = []
     names = set()
     titles = set()
     for rel in related:
-        name=rel.source.canonical_name()
+        name=rel.source.name
         title = rel.source.title
         if name in names and title in titles:
             continue
         names.add(name)
         titles.add(title)
-        url = urlreverse('ietf.doc.views_doc.document_main', kwargs=dict(name=name))
-        if autoescape:
-            name = escape(name)
-            title = escape(title)
+        url = urlreverse('ietf.doc.views_doc.document_main' if document_html is False else 'ietf.doc.views_doc.document_html', kwargs=dict(name=name))
+        name = escape(name)
+        title = escape(title)
         links.append(mark_safe(
             '<a href="%(url)s" title="%(title)s">%(name)s</a>' % dict(name=prettify_std_name(name),
                                                                       title=title,
@@ -282,17 +285,16 @@ def urlize_related_source_list(related, autoescape=None):
         ))
     return links
         
-@register.filter(name='urlize_related_target_list', is_safe=True, needs_autoescape=True)
-def urlize_related_target_list(related, autoescape=None):
+@register.filter(name='urlize_related_target_list', is_safe=True, document_html=False)
+def urlize_related_target_list(related, document_html=False):
     """Convert a list of RelatedDocuments into list of links using the target document's canonical name"""
     links = []
     for rel in related:
-        name=rel.target.document.canonical_name()
-        title = rel.target.document.title
-        url = urlreverse('ietf.doc.views_doc.document_main', kwargs=dict(name=name))
-        if autoescape:
-            name = escape(name)
-            title = escape(title)
+        name=rel.target.name
+        title = rel.target.title
+        url = urlreverse('ietf.doc.views_doc.document_main' if document_html is False else 'ietf.doc.views_doc.document_html', kwargs=dict(name=name))
+        name = escape(name)
+        title = escape(title)
         links.append(mark_safe(
             '<a href="%(url)s" title="%(title)s">%(name)s</a>' % dict(name=prettify_std_name(name),
                                                                       title=title,
@@ -315,10 +317,19 @@ def underline(string):
 
 @register.filter(name='timesince_days')
 def timesince_days(date):
-    """Returns the number of days since 'date' (relative to now)"""
+    """Returns the number of days since 'date' (relative to now)
+
+    >>> timesince_days(timezone.now() - datetime.timedelta(days=2))
+    2
+
+    >>> tz = ZoneInfo(settings.TIME_ZONE)
+    >>> timesince_days(timezone.now().astimezone(tz).date() - datetime.timedelta(days=2))
+    2
+
+    """
     if date.__class__ is not datetime.datetime:
-        date = datetime.datetime(date.year, date.month, date.day)
-    delta = datetime.datetime.now() - date
+        date = datetime.datetime(date.year, date.month, date.day, tzinfo=ZoneInfo(settings.TIME_ZONE))
+    delta = timezone.now() - date
     return delta.days
 
 @register.filter
@@ -400,9 +411,9 @@ def startswith(x, y):
     return str(x).startswith(y)
 
 
-@register.filter(name='removesuffix', is_safe=False)
-def removesuffix(value, suffix):
-    """Remove an exact-match suffix
+@register.filter(name='removeprefix', is_safe=False)
+def removeprefix(value, prefix):
+    """Remove an exact-match prefix
     
     The is_safe flag is False because indiscriminate use of this could result in non-safe output.
     See https://docs.djangoproject.com/en/2.2/howto/custom-template-tags/#filters-and-auto-escaping
@@ -410,8 +421,8 @@ def removesuffix(value, suffix):
     HTML-unsafe output.
     """
     base = str(value)
-    if base.endswith(suffix):
-        return base[:-len(suffix)]
+    if base.startswith(prefix):
+        return base[len(prefix):]
     else:
         return base
 
@@ -501,6 +512,40 @@ def ics_esc(text):
     text = re.sub(r"([\n,;\\])", r"\\\1", text)
     return text
 
+
+@register.simple_tag
+def ics_date_time(dt, tzname):
+    """Render a datetime as an iCalendar date-time
+
+    dt a datetime, localized to the timezone to be displayed
+    tzname is the name for this timezone
+
+    Caller must arrange for a VTIMEZONE for the tzname to be included in the iCalendar file.
+    Output includes a ':'. Use like:
+      DTSTART{% ics_date_time timestamp 'America/Los_Angeles' %}
+    to get
+      DTSTART;TZID=America/Los_Angeles:20221021T111200
+
+    >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'utc')
+    ':20220102T030405Z'
+
+    >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'UTC')
+    ':20220102T030405Z'
+
+    >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'America/Los_Angeles')
+    ';TZID=America/Los_Angeles:20220102T030405'
+    """
+    timestamp = dt.strftime('%Y%m%dT%H%M%S')
+    if tzname.lower() == 'utc':
+        return f':{timestamp}Z'
+    else:
+        return f';TZID={ics_esc(tzname)}:{timestamp}'
+    
+@register.filter
+def next_day(value):
+    return value + datetime.timedelta(days=1)
+
+
 @register.filter
 def consensus(doc):
     """Returns document consensus Yes/No/Unknown."""
@@ -512,6 +557,19 @@ def consensus(doc):
             return "No"
     else:
         return "Unknown"
+
+
+@register.filter
+def std_level_to_label_format(doc):
+    """Returns valid Bootstrap classes to label a status level badge."""
+    if doc.type_id == "rfc":
+        if doc.related_that("obs"):
+            return "obs"
+        else:
+            return doc.std_level_id
+    else:
+        return "draft"
+
 
 @register.filter
 def pos_to_label_format(text):
@@ -525,6 +583,8 @@ def pos_to_label_format(text):
         'Recuse':       'bg-recuse text-light',
         'Not Ready':    'bg-discuss text-light',
         'Need More Time': 'bg-discuss text-light',
+        'Concern': 'bg-discuss text-light',
+
     }.get(str(text), 'bg-norecord text-dark')
 
 @register.filter
@@ -539,6 +599,7 @@ def pos_to_border_format(text):
         'Recuse':       'border-recuse',
         'Not Ready':    'border-discuss',
         'Need More Time': 'border-discuss',
+        'Concern': 'border-discuss',
     }.get(str(text), 'border-norecord')
 
 @register.filter
@@ -612,17 +673,25 @@ def charter_minor_rev(rev):
 @register.filter()
 def can_defer(user,doc):
     ballot = doc.latest_event(BallotDocEvent, type="created_ballot")
-    if ballot and (doc.type_id == "draft" or doc.type_id == "conflrev") and doc.stream_id == 'ietf' and has_role(user, 'Area Director,Secretariat'):
+    if ballot and (doc.type_id == "draft" or doc.type_id == "conflrev" or doc.type_id=="statchg") and doc.stream_id == 'ietf' and has_role(user, 'Area Director,Secretariat'):
         return True
     else:
         return False
 
 @register.filter()
+def can_clear_ballot(user, doc):
+    return can_defer(user, doc)
+
+@register.filter()
+def can_request_rfc_publication(user, doc):
+    return utils_can_request_rfc_publication(user, doc)
+
+@register.filter()
 def can_ballot(user,doc):
-    # Only IRSG memebers (and the secretariat, handled by code separately) can take positions on IRTF documents
-    # Otherwise, an AD can take a position on anything that has a ballot open
-    if doc.type_id == 'draft' and doc.stream_id == 'irtf':
-        return has_role(user,'IRSG Member')
+    if doc.stream_id == "irtf" and doc.type_id == "draft":
+        return has_role(user,"IRSG Member")
+    elif doc.stream_id == "editorial" and doc.type_id == "draft":
+        return has_role(user,"RSAB Member")
     else:
         return user.person.role_set.filter(name="ad", group__type="area", group__state="active")
 
@@ -637,22 +706,22 @@ def action_holder_badge(action_holder):
     >>> action_holder_badge(DocumentActionHolderFactory())
     ''
 
-    >>> action_holder_badge(DocumentActionHolderFactory(time_added=datetime.datetime.now() - datetime.timedelta(days=15)))
+    >>> action_holder_badge(DocumentActionHolderFactory(time_added=timezone.now() - datetime.timedelta(days=15)))
     ''
 
-    >>> action_holder_badge(DocumentActionHolderFactory(time_added=datetime.datetime.now() - datetime.timedelta(days=16)))
-    '<span class="badge rounded-pill bg-danger" title="In state for 16 days; goal is &lt;15 days."><i class="bi bi-clock-fill"></i> 16</span>'
+    >>> action_holder_badge(DocumentActionHolderFactory(time_added=timezone.now() - datetime.timedelta(days=16)))
+    '<span class="badge rounded-pill text-bg-danger" title="In state for 16 days; goal is &lt;15 days."><i class="bi bi-clock-fill"></i> 16</span>'
 
-    >>> action_holder_badge(DocumentActionHolderFactory(time_added=datetime.datetime.now() - datetime.timedelta(days=30)))
-    '<span class="badge rounded-pill bg-danger" title="In state for 30 days; goal is &lt;15 days."><i class="bi bi-clock-fill"></i> 30</span>'
+    >>> action_holder_badge(DocumentActionHolderFactory(time_added=timezone.now() - datetime.timedelta(days=30)))
+    '<span class="badge rounded-pill text-bg-danger" title="In state for 30 days; goal is &lt;15 days."><i class="bi bi-clock-fill"></i> 30</span>'
 
     >>> settings.DOC_ACTION_HOLDER_AGE_LIMIT_DAYS = old_limit
     """
     age_limit = settings.DOC_ACTION_HOLDER_AGE_LIMIT_DAYS
-    age = (datetime.datetime.now() - action_holder.time_added).days
+    age = (timezone.now() - action_holder.time_added).days
     if age > age_limit:
         return mark_safe(
-            '<span class="badge rounded-pill bg-danger" title="In state for %d day%s; goal is &lt;%d days."><i class="bi bi-clock-fill"></i> %d</span>'
+            '<span class="badge rounded-pill text-bg-danger" title="In state for %d day%s; goal is &lt;%d days."><i class="bi bi-clock-fill"></i> %d</span>'
             % (age, "s" if age != 1 else "", age_limit, age)
         )
     else:
@@ -779,3 +848,113 @@ def is_valid_url(url):
     except ValidationError:
         return False
     return True
+
+
+@register.filter
+def badgeify(blob):
+    """
+    Add an appropriate bootstrap badge around "text", based on its contents.
+    """
+    config = [
+        (r"rejected|not ready|serious issues", "danger", "x-lg"),
+        (r"complete|accepted|ready", "success", ""),
+        (r"has nits|almost ready", "info", "info-lg"),
+        (r"has issues|on the right track", "warning", "exclamation-lg"),
+        (r"assigned", "info", "person-plus-fill"),
+        (r"will not review|overtaken by events|withdrawn", "secondary", "dash-lg"),
+        (r"no response", "warning", "question-lg"),
+    ]
+    text = str(blob)
+
+    for pattern, color, icon in config:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            # Shorten the badge text
+            text = re.sub(r"with ", "w/", text, flags=re.IGNORECASE)
+            text = re.sub(r"document", "doc", text, flags=re.IGNORECASE)
+            text = re.sub(r"will not", "won't", text, flags=re.IGNORECASE)
+
+            return mark_safe(
+                f"""
+                <span class="badge rounded-pill text-bg-{color} text-wrap">
+                    <i class="bi bi-{icon}"></i> {text.capitalize()}
+                </span>
+                """
+            )
+
+    return text
+
+@register.filter
+def simple_history_delta_changes(history):
+    """Returns diff between given history and previous entry."""
+    prev = history.prev_record
+    if prev:
+        delta = history.diff_against(prev)
+        return delta.changes
+    return []
+
+@register.filter
+def simple_history_delta_change_cnt(history):
+    """Returns number of changes between given history and previous entry."""
+    prev = history.prev_record
+    if prev:
+        delta = history.diff_against(prev)
+        return len(delta.changes)
+    return 0
+
+@register.filter
+def mtime(path):
+    """Returns a datetime object representing mtime given a pathlib Path object"""
+    return datetime.datetime.fromtimestamp(path.stat().st_mtime).astimezone(ZoneInfo(settings.TIME_ZONE))
+
+@register.filter
+def mtime_is_epoch(path):
+    return path.stat().st_mtime == 0
+
+@register.filter
+def url_for_path(path):
+    """Consructs a 'best' URL for web access to the given pathlib Path object.
+
+    Assumes that the path is into the Internet-Draft archive or the proceedings.
+    """
+    if Path(settings.AGENDA_PATH) in path.parents:
+        return (
+            f"https://www.ietf.org/proceedings/{path.relative_to(settings.AGENDA_PATH)}"
+        )
+    elif any(
+        [
+            pathdir in path.parents
+            for pathdir in [
+                Path(settings.INTERNET_DRAFT_PATH),
+                Path(settings.INTERNET_DRAFT_ARCHIVE_DIR).parent,
+                Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR),
+            ]
+        ]
+    ):
+        return f"{settings.IETF_ID_ARCHIVE_URL}{path.name}"
+    else:
+        return "#"
+
+
+@register.filter
+def is_in_stream(doc):
+    """
+    Check if the doc is in one of the states in it stream that
+    indicate that is actually adopted, i.e., part of the stream.
+    (There are various "candidate" states that necessitate this
+    filter.)
+    """
+    if not doc.stream:
+        return False
+    stream = doc.stream.slug
+    state = doc.get_state_slug(f"draft-stream-{doc.stream.slug}")
+    if not state:
+        return True
+    if stream == "ietf":
+        return state not in ["wg-cand", "c-adopt"]
+    elif stream == "irtf":
+        return state != "candidat"
+    elif stream == "iab":
+        return state not in ["candidat", "diff-org"]
+    elif stream == "editorial":
+        return True
+    return False

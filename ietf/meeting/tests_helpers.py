@@ -1,6 +1,8 @@
-# Copyright The IETF Trust 2020, All Rights Reserved
+# Copyright The IETF Trust 2020-2022, All Rights Reserved
 # -*- coding: utf-8 -*-
 import datetime
+
+import debug    # pyflakes:ignore
 
 from unittest.mock import patch, Mock
 
@@ -8,7 +10,7 @@ from django.conf import settings
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.test import override_settings, RequestFactory
 
-from ietf.group.factories import GroupFactory
+from ietf.group.factories import GroupFactory, GroupHistoryFactory
 from ietf.group.models import Group
 from ietf.meeting.factories import SessionFactory, MeetingFactory, TimeSlotFactory
 from ietf.meeting.helpers import (AgendaFilterOrganizer, AgendaKeywordTagger,
@@ -18,6 +20,7 @@ from ietf.meeting.models import SchedTimeSessAssignment, Session
 from ietf.meeting.test_data import make_meeting_test_data
 from ietf.utils.meetecho import Conference
 from ietf.utils.test_utils import TestCase
+from ietf.utils.timezone import date_today
 
 
 # override the legacy office hours setting to guarantee consistency with the tests
@@ -27,7 +30,8 @@ class AgendaKeywordTaggerTests(TestCase):
         """Assignments should be tagged properly
         
         The historic param can be None, group, or parent, to specify whether to test
-        with no historic_group, a historic_group but no historic_parent, or both.
+        with no GroupHistory active at the time of the Session's meeting, 
+        with such a GroupHistory active, no GroupHistory for the parent, or both.
         """
         # decide whether meeting should use legacy keywords (for office hours)
         legacy_keywords = meeting_num <= 111
@@ -37,14 +41,19 @@ class AgendaKeywordTaggerTests(TestCase):
         group_state_id = 'bof' if bof else 'active'
         group = GroupFactory(state_id=group_state_id)
 
+
         # Set up the historic group and parent if needed. Keep track of these as expected_*
         # for later reference. If not using historic group or parent, fall back to the non-historic
         # groups.
+
         if historic:
-            expected_group = GroupFactory(state_id=group_state_id)
+            history_time = meeting.tz().localize(
+                datetime.datetime.combine(meeting.date, datetime.time())
+                - datetime.timedelta(days=1)
+            )
+            expected_group = GroupHistoryFactory(group=group, time=history_time)
             if historic == 'parent':
-                expected_area = GroupFactory(type_id='area')
-                expected_group.historic_parent = expected_area
+                expected_area = GroupHistoryFactory(group=group.parent,time=history_time)  
             else:
                 expected_area = expected_group.parent
         else:
@@ -110,11 +119,6 @@ class AgendaKeywordTaggerTests(TestCase):
             )
 
         assignments = meeting.schedule.assignments.all()
-
-        # Set up historic groups if needed.
-        if historic:
-            for a in assignments:
-                a.session.historic_group = expected_group
 
         # Execute the method under test
         AgendaKeywordTagger(assignments=assignments).apply()
@@ -483,7 +487,7 @@ class InterimTests(TestCase):
         mock.reset_mock()
         mock_conf_mgr.create.return_value = [
             Conference(
-                manager=mock_conf_mgr, id=1, public_id='some-uuid', description='desc',
+                manager=mock_conf_mgr, id=int(sessions[0].pk), public_id='some-uuid', description='desc',
                 start_time=timeslots[0].utc_start_time(), duration=timeslots[0].duration, url='fake-meetecho-url',
                 deletion_token='please-delete-me',
             ),
@@ -494,6 +498,7 @@ class InterimTests(TestCase):
             mock_conf_mgr.create.call_args[1],
             {
                 'group': sessions[0].group,
+                'session_id': sessions[0].id,
                 'description': str(sessions[0]),
                 'start_time': timeslots[0].utc_start_time(),
                 'duration': timeslots[0].duration,
@@ -508,12 +513,12 @@ class InterimTests(TestCase):
         mock.reset_mock()
         mock_conf_mgr.create.side_effect = [
             [Conference(
-                manager=mock_conf_mgr, id=1, public_id='some-uuid', description='desc',
+                manager=mock_conf_mgr, id=int(sessions[0].pk), public_id='some-uuid', description='desc',
                 start_time=timeslots[0].utc_start_time(), duration=timeslots[0].duration, url='different-fake-meetecho-url',
                 deletion_token='please-delete-me',
             )],
             [Conference(
-                manager=mock_conf_mgr, id=2, public_id='another-uuid', description='desc',
+                manager=mock_conf_mgr, id=int(sessions[1].pk), public_id='another-uuid', description='desc',
                 start_time=timeslots[1].utc_start_time(), duration=timeslots[1].duration, url='another-fake-meetecho-url',
                 deletion_token='please-delete-me-too',
             )],
@@ -524,16 +529,18 @@ class InterimTests(TestCase):
             mock_conf_mgr.create.call_args_list,
             [
                 ({
-                    'group': sessions[0].group,
-                    'description': str(sessions[0]),
-                    'start_time': timeslots[0].utc_start_time(),
-                    'duration': timeslots[0].duration,
+                     'group': sessions[0].group,
+                     'session_id': sessions[0].id,
+                     'description': str(sessions[0]),
+                     'start_time': timeslots[0].utc_start_time(),
+                     'duration': timeslots[0].duration,
                  },),
                 ({
-                    'group': sessions[1].group,
-                    'description': str(sessions[1]),
-                    'start_time': timeslots[1].utc_start_time(),
-                    'duration': timeslots[1].duration,
+                     'group': sessions[1].group,
+                     'session_id': sessions[1].id,
+                     'description': str(sessions[1]),
+                     'start_time': timeslots[1].utc_start_time(),
+                     'duration': timeslots[1].duration,
                  },),
             ]
         )
@@ -586,26 +593,26 @@ class InterimTests(TestCase):
         mock_form.changed_data = []
         mock_form.requires_approval = True
 
-        mock_form.cleaned_data = {'remote_participation': None}
+        mock_form.cleaned_data = {'date': date_today(), 'time': datetime.time(1, 23), 'remote_participation': None}
         sessions_post_save(RequestFactory().post('/some/url'), [mock_form])
         self.assertTrue(mock_create_method.called)
         self.assertCountEqual(mock_create_method.call_args[0][0], [])
 
         mock_create_method.reset_mock()
-        mock_form.cleaned_data = {'remote_participation': 'manual'}
+        mock_form.cleaned_data['remote_participation'] = 'manual'
         sessions_post_save(RequestFactory().post('/some/url'), [mock_form])
         self.assertTrue(mock_create_method.called)
         self.assertCountEqual(mock_create_method.call_args[0][0], [])
 
         mock_create_method.reset_mock()
-        mock_form.cleaned_data = {'remote_participation': 'meetecho'}
+        mock_form.cleaned_data['remote_participation'] = 'meetecho'
         sessions_post_save(RequestFactory().post('/some/url'), [mock_form])
         self.assertTrue(mock_create_method.called)
         self.assertCountEqual(mock_create_method.call_args[0][0], [session])
 
         # Check that an exception does not percolate through sessions_post_save
         mock_create_method.side_effect = RuntimeError('some error')
-        mock_form.cleaned_data = {'remote_participation': 'meetecho'}
+        mock_form.cleaned_data['remote_participation'] = 'meetecho'
         # create mock request with session / message storage
         request = RequestFactory().post('/some/url')
         setattr(request, 'session', 'session')
@@ -623,12 +630,13 @@ class HelperTests(TestCase):
     def test_get_ietf_meeting(self):
         """get_ietf_meeting() should only return IETF meetings"""
         # put the IETF far in the past so it's not "current"
-        ietf = MeetingFactory(type_id='ietf', date=datetime.date.today() - datetime.timedelta(days=5 * 365))
+        today = date_today()
+        ietf = MeetingFactory(type_id='ietf', date=today- datetime.timedelta(days=5 * 365))
         # put the interim meeting now so it will be picked up as "current" if there's a bug
-        interim = MeetingFactory(type_id='interim', date=datetime.date.today())
+        interim = MeetingFactory(type_id='interim', date=today)
         self.assertEqual(get_ietf_meeting(ietf.number), ietf, 'Return IETF meeting by number')
         self.assertIsNone(get_ietf_meeting(interim.number), 'Ignore non-IETF meetings')
         self.assertIsNone(get_ietf_meeting(), 'Return None if there is no current IETF meeting')
-        ietf.date = datetime.date.today()
+        ietf.date = today
         ietf.save()
         self.assertEqual(get_ietf_meeting(), ietf, 'Return current meeting if there is one')

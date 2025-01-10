@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 
 
-import io
 import itertools
 import json
 import os
 import datetime
+from pathlib import Path
 import requests
 import email.utils
 
-from django.utils.http import is_safe_url
+from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
+
 from simple_history.utils import update_change_reason
 
 import debug    # pyflakes:ignore
@@ -26,7 +28,7 @@ from django.core.exceptions import ValidationError
 from django.template.loader import render_to_string, TemplateDoesNotExist
 from django.urls import reverse as urlreverse
 
-from ietf.doc.models import (Document, NewRevisionDocEvent, State, DocAlias,
+from ietf.doc.models import (Document, NewRevisionDocEvent, State,
                              LastCallDocEvent, ReviewRequestDocEvent, ReviewAssignmentDocEvent, DocumentAuthor)
 from ietf.name.models import (ReviewRequestStateName, ReviewAssignmentStateName, ReviewResultName, 
                              ReviewTypeName)
@@ -50,8 +52,11 @@ from ietf.utils.text import strip_prefix, xslugify
 from ietf.utils.textupload import get_cleaned_text_file_content
 from ietf.utils.mail import send_mail_message
 from ietf.mailtrigger.utils import gather_address_lists
-from ietf.utils.fields import MultiEmailField
+from ietf.utils.fields import ModelMultipleChoiceField, MultiEmailField
+from ietf.utils.http import is_ajax
 from ietf.utils.response import permission_denied
+from ietf.utils.timezone import date_today, DEADLINE_TZINFO
+
 
 def clean_doc_revision(doc, rev):
     if rev:
@@ -63,7 +68,7 @@ def clean_doc_revision(doc, rev):
     return rev
 
 class RequestReviewForm(forms.ModelForm):
-    team = forms.ModelMultipleChoiceField(queryset=Group.objects.all(), widget=forms.CheckboxSelectMultiple)
+    team = ModelMultipleChoiceField(queryset=Group.objects.all(), widget=forms.CheckboxSelectMultiple)
     deadline = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={ "autoclose": "1", "start-date": "+0d" })
 
     class Meta:
@@ -92,7 +97,7 @@ class RequestReviewForm(forms.ModelForm):
 
     def clean_deadline(self):
         v = self.cleaned_data.get('deadline')
-        if v < datetime.date.today():
+        if v < date_today(DEADLINE_TZINFO):
             raise forms.ValidationError("Select today or a date in the future.")
         return v
 
@@ -112,12 +117,12 @@ class RequestReviewForm(forms.ModelForm):
 
 @login_required
 def request_review(request, name):
-    doc = get_object_or_404(Document, name=name)
+    doc = get_object_or_404(Document, type_id="draft", name=name)
 
     if not can_request_review_of_doc(request.user, doc):
         permission_denied(request, "You do not have permission to perform this action")
 
-    now = datetime.datetime.now()
+    now = timezone.now()
 
     lc_ends = None
     e = doc.latest_event(LastCallDocEvent, type="sent_last_call")
@@ -214,11 +219,13 @@ def review_request(request, name, request_id):
     
     can_edit_deadline = can_edit_comment
 
+    can_add_comment = can_manage_request
+
     assignments = review_req.reviewassignment_set.all()
     for assignment in assignments:
         assignment.is_reviewer = user_is_person(request.user, assignment.reviewer.person)
 
-        assignment.can_accept_reviewer_assignment = (assignment.state_id == "assigned"
+        assignment.can_accept_reviewer_assignment = (assignment.state_id in ["assigned", "rejected"]
                                                      and (assignment.is_reviewer or can_manage_request))
 
         assignment.can_reject_reviewer_assignment = (assignment.state_id in ["assigned", "accepted"]
@@ -255,6 +262,7 @@ def review_request(request, name, request_id):
         'can_assign_reviewer': can_assign_reviewer,
         'can_edit_comment': can_edit_comment,
         'can_edit_deadline': can_edit_deadline,
+        'can_add_comment': can_add_comment,
         'assignments': assignments,
         'wg_chairs': wg_chairs,
         'iesg_state_summary': iesg_state_summary,
@@ -305,6 +313,31 @@ def close_request(request, name, request_id):
         'form': form,
     })
 
+class AddCommentForm(forms.Form):
+    comment = forms.CharField(required=True, widget=forms.Textarea, strip=False)
+
+@login_required
+def add_request_comment(request, name, request_id):
+    doc = get_object_or_404(Document, name=name)
+    review_req = get_object_or_404(ReviewRequest, pk=request_id)
+
+    can_request = is_authorized_in_doc_stream(request.user, doc)
+    can_manage_request = can_manage_review_requests_for_team(request.user, review_req.team)
+    if not (can_request or can_manage_request):
+        permission_denied(request, "You do not have permission to perform this action")
+
+    if request.method == "POST":
+        form = AddCommentForm(request.POST)
+        if form.is_valid():
+            c = form.cleaned_data['comment']
+
+            review_req.add_history(c)
+            return redirect(review_request, name=review_req.doc.name, request_id=review_req.pk)
+    else:
+        form = AddCommentForm()
+
+    return render(request, 'doc/add_comment.html',
+                  dict(doc=doc, form=form, review_req=review_req))
 
 class AssignReviewerForm(forms.Form):
     reviewer = PersonEmailChoiceField(label="Assign Additional Reviewer", empty_label="(None)")
@@ -343,13 +376,19 @@ def assign_reviewer(request, name, request_id):
 
 class RejectReviewerAssignmentForm(forms.Form):
     message_to_secretary = forms.CharField(widget=forms.Textarea, required=False, help_text="Optional explanation of rejection, will be emailed to team secretary if filled in", strip=False)
+    wants_to_be_next = forms.BooleanField(label="I want to be assigned new document immediately", required=False)
 
 @login_required
 def reject_reviewer_assignment(request, name, assignment_id):
     doc = get_object_or_404(Document, name=name)
     review_assignment = get_object_or_404(ReviewAssignment, pk=assignment_id, state__in=["assigned", "accepted"])
-    review_request_past_deadline = review_assignment.review_request.deadline < datetime.date.today()
 
+    allow_reject_request = True
+    # Only check deadline if the group does not allow rejecting always
+    if not review_assignment.review_request.team.reviewteamsettings.allow_reviewer_to_reject_after_deadline:
+        if review_assignment.review_request.deadline < date_today(DEADLINE_TZINFO):
+            allow_reject_request = False
+    
     if not review_assignment.reviewer:
         return redirect(review_request, name=review_assignment.review_request.doc.name, request_id=review_assignment.review_request.pk)
 
@@ -359,12 +398,17 @@ def reject_reviewer_assignment(request, name, assignment_id):
     if not (is_reviewer or can_manage_request):
         permission_denied(request, "You do not have permission to perform this action")
 
-    if request.method == "POST" and request.POST.get("action") == "reject" and not review_request_past_deadline:
+    # Secretary or whoever can manage review request, has permission
+    # to reject requests even if the deadline is in the past
+    if can_manage_request:
+        allow_reject_request = True
+
+    if request.method == "POST" and request.POST.get("action") == "reject" and allow_reject_request:
         form = RejectReviewerAssignmentForm(request.POST)
         if form.is_valid():
             # reject the assignment
             review_assignment.state = ReviewAssignmentStateName.objects.get(slug="rejected")
-            review_assignment.completed_on = datetime.datetime.now()
+            review_assignment.completed_on = timezone.now()
             review_assignment.save()
 
             descr = "Assignment of request for {} review by {} to {} was rejected".format(
@@ -383,12 +427,10 @@ def reject_reviewer_assignment(request, name, assignment_id):
                 state=review_assignment.state,
             )
 
-            policy = get_reviewer_queue_policy(review_assignment.review_request.team)
-            policy.return_reviewer_to_rotation_top(review_assignment.reviewer.person)
-
             msg = render_to_string("review/reviewer_assignment_rejected.txt", {
                 "by": request.user.person,
-                "message_to_secretary": form.cleaned_data.get("message_to_secretary")
+                "message_to_secretary": form.cleaned_data.get("message_to_secretary"),
+                "wants_to_be_next" : form.cleaned_data['wants_to_be_next']
             })
 
             email_review_assignment_change(request, review_assignment, "Reviewer assignment rejected", msg, by=request.user.person, notify_secretary=True, notify_reviewer=True, notify_requested_by=False)
@@ -402,7 +444,7 @@ def reject_reviewer_assignment(request, name, assignment_id):
         'review_req': review_assignment.review_request,
         'assignments': review_assignment.review_request.reviewassignment_set.all(),
         'form': form,
-        'review_request_past_deadline': review_request_past_deadline,
+        'allow_reject_request': allow_reject_request,
     })
 
 @login_required
@@ -434,7 +476,7 @@ def withdraw_reviewer_assignment(request, name, assignment_id):
         )            
 
         policy = get_reviewer_queue_policy(review_assignment.review_request.team)
-        policy.return_reviewer_to_rotation_top(review_assignment.reviewer.person)
+        policy.set_wants_to_be_next(review_assignment.reviewer.person)
         
         msg = "Review assignment withdrawn by %s"%request.user.person
 
@@ -531,7 +573,7 @@ class CompleteReviewForm(forms.Form):
     review_url = forms.URLField(label="Link to message", required=False)
     review_file = forms.FileField(label="Text file to upload", required=False)
     review_content = forms.CharField(widget=forms.Textarea, required=False, strip=False)
-    completion_date = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={ "autoclose": "1" }, initial=datetime.date.today, help_text="Date of announcement of the results of this review")
+    completion_date = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={ "autoclose": "1" }, initial=date_today, help_text="Date of announcement of the results of this review")
     completion_time = forms.TimeField(widget=forms.HiddenInput, initial=datetime.time.min)
     cc = MultiEmailField(required=False, help_text="Email addresses to send to in addition to the review team list")
     email_ad = forms.BooleanField(label="Send extra email to the responsible AD suggesting early attention", required=False)
@@ -704,13 +746,14 @@ def complete_review(request, name, assignment_id=None, acronym=None):
                     team.acronym, 
                     request_type.slug,
                     xslugify(reviewer.person.ascii_parts()[3]),
-                    datetime.date.today().isoformat(),
+                    date_today().isoformat(),
                 ]
                 review_name = "-".join(c for c in name_components if c).lower()
-                if not Document.objects.filter(name=review_name).exists():
-                    review = Document.objects.create(name=review_name,type_id='review',group=team)
-                    DocAlias.objects.create(name=review_name).docs.add(review)
-                else:
+                review, created = Document.objects.get_or_create(
+                    name=review_name,
+                    defaults={'type_id': 'review', 'group': team},
+                )
+                if not created:
                     messages.warning(request, message='Attempt to save review failed: review document already exists. This most likely occurred because the review was submitted twice in quick succession. If you intended to submit a new review, rather than update an existing one, things are probably OK. Please verify that the shown review is what you expected.')
                     return redirect("ietf.doc.views_doc.document_main", name=review_name)
 
@@ -723,7 +766,7 @@ def complete_review(request, name, assignment_id=None, acronym=None):
                     type=form.cleaned_data['review_type'],
                     doc=doc,
                     team=team,
-                    deadline=datetime.date.today(),
+                    deadline=date_today(DEADLINE_TZINFO),
                     requested_by=Person.objects.get(user=request.user),
                     requested_rev=form.cleaned_data['reviewed_rev'],
                 )
@@ -731,13 +774,13 @@ def complete_review(request, name, assignment_id=None, acronym=None):
                     review_request=review_request,
                     state_id='assigned',
                     reviewer=form.cleaned_data['reviewer'].role_email('reviewer', group=team),
-                    assigned_on=datetime.datetime.now(),
+                    assigned_on=timezone.now(),
                     review = review,
                 )
 
             review.rev = "00" if not review.rev else "{:02}".format(int(review.rev) + 1)
             review.title = "{} Review of {}-{}".format(assignment.review_request.type.name, assignment.review_request.doc.name, form.cleaned_data["reviewed_rev"])
-            review.time = datetime.datetime.now()
+            review.time = timezone.now()
             if review_submission == "link":
                 review.external_url = form.cleaned_data['review_url']
 
@@ -760,13 +803,21 @@ def complete_review(request, name, assignment_id=None, acronym=None):
             else:
                 content = form.cleaned_data['review_content']
 
-            filename = os.path.join(review.get_file_path(), '{}.txt'.format(review.name))
-            with io.open(filename, 'w', encoding='utf-8') as destination:
-                destination.write(content)
+            review_path = Path(review.get_file_path()) / f"{review.name}.txt"
+            review_path.write_text(content)
+            review_ftp_path = Path(settings.FTP_DIR) / "review" / review_path.name
+            # See https://github.com/ietf-tools/datatracker/issues/6941 - when that's
+            # addressed, making this link should not be conditional
+            if not review_ftp_path.exists():
+                os.link(review_path, review_ftp_path) # switch this to Path.hardlink when python>=3.10 is available
 
-            completion_datetime = datetime.datetime.now()
+            completion_datetime = timezone.now()
             if "completion_date" in form.cleaned_data:
-                completion_datetime = datetime.datetime.combine(form.cleaned_data["completion_date"], form.cleaned_data.get("completion_time") or datetime.time.min)
+                completion_datetime = datetime.datetime.combine(
+                    form.cleaned_data["completion_date"],
+                    form.cleaned_data.get("completion_time") or datetime.time.min,
+                    tzinfo=DEADLINE_TZINFO,
+                )
 
             # complete assignment
             assignment.state = form.cleaned_data["state"]
@@ -778,7 +829,7 @@ def complete_review(request, name, assignment_id=None, acronym=None):
 
             need_to_email_review = review_submission != "link" and assignment.review_request.team.list_email and not revising_review
 
-            submitted_on_different_date = completion_datetime.date() != datetime.date.today()
+            submitted_on_different_date = completion_datetime.date() != date_today(DEADLINE_TZINFO)
             desc = "Request for {} review by {} {}: {}. Reviewer: {}.".format(
                 assignment.review_request.type.name,
                 assignment.review_request.team.acronym.upper(),
@@ -799,7 +850,7 @@ def complete_review(request, name, assignment_id=None, acronym=None):
             close_event.by = request.user.person
             close_event.desc = desc
             close_event.state = assignment.state
-            close_event.time = datetime.datetime.now()
+            close_event.time = timezone.now()
             close_event.save()
             
             # If the completion date is different, record when the initial review was made too.
@@ -894,8 +945,13 @@ def complete_review(request, name, assignment_id=None, acronym=None):
         }
 
         try:
-            initial['review_content'] = render_to_string('/group/%s/review/content_templates/%s.txt' % (assignment.review_request.team.acronym,
-                                                                                                        request_type.slug), {'assignment':assignment, 'today':datetime.date.today()}) 
+            initial['review_content'] = render_to_string(
+                f'/group/{assignment.review_request.team.acronym}/review/content_templates/{request_type.slug}.txt',
+                {
+                    'assignment': assignment,
+                    'today': date_today(settings.TIME_ZONE),
+                },
+            )
         except (TemplateDoesNotExist, AttributeError):
             pass
 
@@ -984,7 +1040,7 @@ class EditReviewRequestDeadlineForm(forms.ModelForm):
 
     def clean_deadline(self):
         v = self.cleaned_data.get('deadline')
-        if v < datetime.date.today():
+        if v < date_today(DEADLINE_TZINFO):
             raise forms.ValidationError("Select today or a date in the future.")
         return v
 
@@ -1001,7 +1057,11 @@ def edit_deadline(request, name, request_id):
         if form.is_valid():
             if form.cleaned_data['deadline'] != old_deadline:
                 form.save()
-                subject = "Deadline changed: {} {} review of {}-{}".format(review_req.team.acronym.capitalize(),review_req.type.name.lower(), review_req.doc.name, review_req.requested_rev)
+                subject = f"Deadline changed: {review_req.team.acronym.capitalize()} {review_req.type.name.lower()} review of {review_req.doc.name}"
+                if review_req.requested_rev:
+                    subject += f"-{review_req.requested_rev}"
+                descr = "Deadine changed from {} to {}".format(old_deadline, review_req.deadline)
+                update_change_reason(review_req, descr)
                 msg = render_to_string("review/deadline_changed.txt", {
                     "review_req": review_req,
                     "old_deadline": old_deadline,
@@ -1039,7 +1099,7 @@ class ReviewWishAddForm(forms.Form):
 
 @login_required
 def review_wish_add(request, name):
-    doc = get_object_or_404(Document, docalias__name=name)
+    doc = get_object_or_404(Document, name=name)
 
     if request.method == "POST":
         form = ReviewWishAddForm(request.user, doc, request.POST)
@@ -1056,7 +1116,7 @@ def review_wish_add(request, name):
 
 @login_required
 def review_wishes_remove(request, name):
-    doc = get_object_or_404(Document, docalias__name=name)
+    doc = get_object_or_404(Document, name=name)
     person = get_object_or_404(Person, user=request.user)
 
     if request.method == "POST":
@@ -1069,11 +1129,16 @@ def review_wishes_remove(request, name):
 
 
 def _generate_ajax_or_redirect_response(request, doc):
-    redirect_url = request.GET.get('next')
-    url_is_safe = is_safe_url(url=redirect_url, allowed_hosts=request.get_host(),
-                              require_https=request.is_secure())
-    if request.is_ajax():
-        return HttpResponse(json.dumps({'success': True}), content_type='application/json')
+    redirect_url = request.GET.get("next")
+    url_is_safe = url_has_allowed_host_and_scheme(
+        url=redirect_url,
+        allowed_hosts=request.get_host(),
+        require_https=request.is_secure(),
+    )
+    if is_ajax(request):
+        return HttpResponse(
+            json.dumps({"success": True}), content_type="application/json"
+        )
     elif url_is_safe:
         return HttpResponseRedirect(redirect_url)
     else:

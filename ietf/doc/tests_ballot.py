@@ -12,24 +12,28 @@ import debug                            # pyflakes:ignore
 from django.test import RequestFactory
 from django.utils.text import slugify
 from django.urls import reverse as urlreverse
+from django.utils import timezone
 
 from ietf.doc.models import (Document, State, DocEvent,
                              BallotPositionDocEvent, LastCallDocEvent, WriteupDocEvent, TelechatDocEvent)
 from ietf.doc.factories import (DocumentFactory, IndividualDraftFactory, IndividualRfcFactory, WgDraftFactory,
-                                BallotPositionDocEventFactory, BallotDocEventFactory)
+                                BallotPositionDocEventFactory, BallotDocEventFactory, IRSGBallotDocEventFactory)
+from ietf.doc.templatetags.ietf_filters import can_defer
 from ietf.doc.utils import create_ballot_if_not_open
+from ietf.doc.views_ballot import parse_ballot_edit_return_point
 from ietf.doc.views_doc import document_ballot_content
 from ietf.group.models import Group, Role
 from ietf.group.factories import GroupFactory, RoleFactory, ReviewTeamFactory
 from ietf.ipr.factories import HolderIprDisclosureFactory
 from ietf.name.models import BallotPositionName
 from ietf.iesg.models import TelechatDate
-from ietf.person.models import Person, PersonalApiKey
-from ietf.person.factories import PersonFactory
+from ietf.person.models import Person
+from ietf.person.factories import PersonFactory, PersonalApiKeyFactory
 from ietf.person.utils import get_active_ads
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
 from ietf.utils.text import unwrap
+from ietf.utils.timezone import date_today, datetime_today
 
 
 class EditPositionTests(TestCase):
@@ -105,9 +109,9 @@ class EditPositionTests(TestCase):
         draft = WgDraftFactory(ad=ad)
         url = urlreverse('ietf.doc.views_ballot.api_set_position')
         create_ballot_if_not_open(None, draft, ad, 'approve')
-        ad.user.last_login = datetime.datetime.now()
+        ad.user.last_login = timezone.now()
         ad.user.save()
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=ad)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=ad)
 
         # vote
         events_before = draft.docevent_set.count()
@@ -226,6 +230,9 @@ class EditPositionTests(TestCase):
         r = self.client.post(url, dict(position="discuss", discuss="Test discuss text"))
         self.assertEqual(r.status_code, 403)
         
+    # N.B. This test needs to be rewritten to exercise all types of ballots (iesg, irsg, rsab)
+    # and test against the output of the mailtriggers instead of looking for hardcoded values
+    # in the To and CC results. See #7864
     def test_send_ballot_comment(self):
         ad = Person.objects.get(user__username="ad")
         draft = WgDraftFactory(ad=ad,group__acronym='mars')
@@ -238,9 +245,9 @@ class EditPositionTests(TestCase):
             doc=draft, rev=draft.rev, type="changed_ballot_position",
             by=ad, balloter=ad, ballot=ballot, pos=BallotPositionName.objects.get(slug="discuss"),
             discuss="This draft seems to be lacking a clearer title?",
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             comment="Test!",
-            comment_time=datetime.datetime.now())
+            comment_time=timezone.now())
         
         url = urlreverse('ietf.doc.views_ballot.send_ballot_comment', kwargs=dict(name=draft.name,
                                                                 ballot_id=ballot.pk))
@@ -466,7 +473,7 @@ class BallotWriteupsTests(TestCase):
                     doc=draft,
                     rev=draft.rev,
                     desc='issued last call',
-                    expires = datetime.datetime.now()+datetime.timedelta(days = 1 if case=='future' else -1)
+                    expires = timezone.now()+datetime.timedelta(days = 1 if case=='future' else -1)
                 )
             url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
             login_testing_unauthorized(self, "ad", url)
@@ -526,12 +533,45 @@ class BallotWriteupsTests(TestCase):
         login_testing_unauthorized(self, "secretary", url)
 
         # expect warning about issuing a ballot before IETF Last Call is done
+        # No last call has yet been issued
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
         self.assertEqual(len(q('textarea[name=ballot_writeup]')), 1)
         self.assertTrue(q('[class=text-danger]:contains("not completed IETF Last Call")'))
         self.assertTrue(q('[type=submit]:contains("Save")'))
+
+        # Last call exists but hasn't expired
+        LastCallDocEvent.objects.create(
+            doc=draft,
+            expires=datetime_today()+datetime.timedelta(days=14),
+            by=Person.objects.get(name="(System)")
+        )
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertTrue(q('[class=text-danger]:contains("not completed IETF Last Call")'))
+
+        # Last call exists and has expired
+        LastCallDocEvent.objects.filter(doc=draft).update(expires=datetime_today()-datetime.timedelta(days=2))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertFalse(q('[class=text-danger]:contains("not completed IETF Last Call")'))
+
+        for state_slug in ["lc", "ad-eval"]:
+            draft.set_state(State.objects.get(type="draft-iesg",slug=state_slug))
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 200)
+            q = PyQuery(r.content)
+            self.assertTrue(q('[class=text-danger]:contains("It would be unexpected to issue a ballot while in this state.")'))
+
+        draft.set_state(State.objects.get(type="draft-iesg",slug="writeupw"))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertFalse(q('[class=text-danger]:contains("It would be unexpected to issue a ballot while in this state.")'))         
+                         
 
     def test_edit_approval_text(self):
         ad = Person.objects.get(user__username="ad")
@@ -770,7 +810,7 @@ class ApproveBallotTests(TestCase):
         ballot = create_ballot_if_not_open(None, draft, ad, 'approve')
         old_ballot_id = ballot.id
         draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="iesg-eva")) 
-        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug=draft.ballot_open('approve').ballot_type.slug))
+        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug="approve"))
         login_testing_unauthorized(self, "secretary", url)
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
@@ -780,6 +820,11 @@ class ApproveBallotTests(TestCase):
         self.assertIsNotNone(ballot)
         self.assertEqual(ballot.ballotpositiondocevent_set.count(),0)
         self.assertNotEqual(old_ballot_id, ballot.id)
+        # It's not valid to clear a ballot of a type where there's no matching state
+        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug="statchg"))
+        r = self.client.post(url,{})
+        self.assertEqual(r.status_code, 404)
+ 
 
     def test_ballot_downref_approve(self):
         ad = Person.objects.get(name="Areað Irector")
@@ -791,7 +836,7 @@ class ApproveBallotTests(TestCase):
                   doc=draft,
                   rev=draft.rev,
                   desc='issued last call',
-                  expires = datetime.datetime.now()-datetime.timedelta(days=14) )
+                  expires = timezone.now()-datetime.timedelta(days=14) )
         WriteupDocEvent.objects.create(
                   by=Person.objects.get(name='(System)'),
                   doc=draft,
@@ -800,8 +845,8 @@ class ApproveBallotTests(TestCase):
                   desc='Last call announcement was changed',
                   text='this is simple last call text.' )
         rfc = IndividualRfcFactory.create(
+                  name = "rfc6666",
                   stream_id='ise',
-                  other_aliases=['rfc6666',],
                   states=[('draft','rfc'),('draft-iesg','pub')],
                   std_level_id='inf', )
 
@@ -818,7 +863,7 @@ class ApproveBallotTests(TestCase):
         self.assertContains(r, "No downward references for")
 
         # Add a downref, the page should ask if it should be added to the registry
-        rel = draft.relateddocument_set.create(target=rfc.docalias.get(name='rfc6666'),relationship_id='refnorm')
+        rel = draft.relateddocument_set.create(target=rfc, relationship_id='refnorm')
         d = [rdoc for rdoc in draft.relateddocument_set.all() if rel.is_approved_downref()]
         original_len = len(d)
         r = self.client.get(url)
@@ -898,7 +943,7 @@ class MakeLastCallTests(TestCase):
 
         mailbox_before = len(outbox)
 
-        last_call_sent_date = datetime.date.today()
+        last_call_sent_date = date_today()
         expire_date = last_call_sent_date+datetime.timedelta(days=14)
         
         r = self.client.post(url,
@@ -1067,6 +1112,35 @@ class DeferUndeferTestCase(TestCase):
         DocumentFactory(type_id='statchg',name='status-change-imaginary-mid-review',states=[('statchg','iesgeval')])
         DocumentFactory(type_id='conflrev',name='conflict-review-imaginary-irtf-submission',states=[('conflrev','iesgeval')])
 
+class IetfFiltersTests(TestCase):
+    def test_can_defer(self):
+        secretariat = Person.objects.get(user__username="secretary").user
+        ad = Person.objects.get(user__username="ad").user
+        irtf_chair = Person.objects.get(user__username="irtf-chair").user
+        rsab_chair = Person.objects.get(user__username="rsab-chair").user
+        irsg_member = RoleFactory(group__type_id="rg", name_id="chair").person.user
+        rsab_member = RoleFactory(group=Group.objects.get(acronym="rsab"), name_id="member").person.user
+        nobody = PersonFactory().user
+
+        users = set([secretariat, ad, irtf_chair, rsab_chair, irsg_member, rsab_member, nobody])
+
+        iesg_ballot = BallotDocEventFactory(doc__stream_id='ietf')
+        self.assertTrue(can_defer(secretariat, iesg_ballot.doc))
+        self.assertTrue(can_defer(ad, iesg_ballot.doc))
+        for user in users - set([secretariat, ad]):
+            self.assertFalse(can_defer(user, iesg_ballot.doc))
+
+        irsg_ballot = IRSGBallotDocEventFactory(doc__stream_id='irtf')
+        for user in users:
+            self.assertFalse(can_defer(user, irsg_ballot.doc))
+
+        rsab_ballot = BallotDocEventFactory(ballot_type__slug='rsab-approve', doc__stream_id='editorial')
+        for user in users:
+            self.assertFalse(can_defer(user, rsab_ballot.doc))        
+
+    def test_can_clear_ballot(self):
+        pass # Right now, can_clear_ballot is implemented by can_defer
+
 class RegenerateLastCallTestCase(TestCase):
 
     def test_regenerate_last_call(self):
@@ -1089,13 +1163,13 @@ class RegenerateLastCallTestCase(TestCase):
         self.assertFalse("contains these normative down" in lc_text)
 
         rfc = IndividualRfcFactory.create(
+                  rfc_number=6666,
                   stream_id='ise',
-                  other_aliases=['rfc6666',],
                   states=[('draft','rfc'),('draft-iesg','pub')],
                   std_level_id='inf',
               )
 
-        draft.relateddocument_set.create(target=rfc.docalias.get(name='rfc6666'),relationship_id='refnorm')
+        draft.relateddocument_set.create(target=rfc,relationship_id='refnorm')
 
         r = self.client.post(url, dict(regenerate_last_call_text="1"))
         self.assertEqual(r.status_code, 200)
@@ -1105,7 +1179,7 @@ class RegenerateLastCallTestCase(TestCase):
         self.assertTrue("rfc6666" in lc_text)
         self.assertTrue("Independent Submission" in lc_text)
 
-        draft.relateddocument_set.create(target=rfc.docalias.get(name='rfc6666'), relationship_id='downref-approval')
+        draft.relateddocument_set.create(target=rfc, relationship_id='downref-approval')
 
         r = self.client.post(url, dict(regenerate_last_call_text="1"))
         self.assertEqual(r.status_code, 200)
@@ -1117,7 +1191,7 @@ class RegenerateLastCallTestCase(TestCase):
 
 class BallotContentTests(TestCase):
     def test_ballotpositiondocevent_any_email_sent(self):
-        now = datetime.datetime.now()  # be sure event timestamps are at distinct times
+        now = timezone.now()  # be sure event timestamps are at distinct times
         bpde_with_null_send_email = BallotPositionDocEventFactory(
             time=now - datetime.timedelta(minutes=30),
             send_email=None,
@@ -1196,11 +1270,12 @@ class BallotContentTests(TestCase):
         )
 
     def _assertBallotMessage(self, q, balloter, expected):
-        heading = q(f'p.h5[id$="_{slugify(balloter.plain_name())}"]')
+        heading = q(f'div.h5[id$="_{slugify(balloter.plain_name())}"]')
         self.assertEqual(len(heading), 1)
-        # <p.h5/> is followed by a panel with the message of interest, so use next()
+        # <div.h5> is followed by a panel with the message of interest, so use next()
+        next = heading.next()
         self.assertEqual(
-            len(heading.next().find(
+            len(next.find(
                 f'*[title="{expected}"]'
             )),
             1,
@@ -1219,7 +1294,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[0],
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=True,
         )
         BallotPositionDocEventFactory(
@@ -1227,7 +1302,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[1],
             pos_id='noobj',
             comment='Commentary',
-            comment_time=datetime.datetime.now(),
+            comment_time=timezone.now(),
             send_email=True,
         )
 
@@ -1237,7 +1312,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[2],
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=False,
         )
         BallotPositionDocEventFactory(
@@ -1245,7 +1320,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[3],
             pos_id='noobj',
             comment='Commentary',
-            comment_time=datetime.datetime.now(),
+            comment_time=timezone.now(),
             send_email=False,
         )
 
@@ -1255,7 +1330,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[4],
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now() - datetime.timedelta(days=1),
+            discuss_time=timezone.now() - datetime.timedelta(days=1),
             send_email=True,
         )
         BallotPositionDocEventFactory(
@@ -1263,7 +1338,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[4],
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=False,
         )
         BallotPositionDocEventFactory(
@@ -1271,7 +1346,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[5],
             pos_id='noobj',
             comment='Commentary',
-            comment_time=datetime.datetime.now() - datetime.timedelta(days=1),
+            comment_time=timezone.now() - datetime.timedelta(days=1),
             send_email=True,
         )
         BallotPositionDocEventFactory(
@@ -1279,7 +1354,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[5],
             pos_id='noobj',
             comment='Commentary',
-            comment_time=datetime.datetime.now(),
+            comment_time=timezone.now(),
             send_email=False,
         )
 
@@ -1296,7 +1371,7 @@ class BallotContentTests(TestCase):
             balloter__plain='plain name1',
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=False,
         ).balloter
         send_email_balloter = BallotPositionDocEventFactory(
@@ -1304,7 +1379,7 @@ class BallotContentTests(TestCase):
             balloter__plain='plain name2',
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=True,
         ).balloter
         prev_send_email_balloter = BallotPositionDocEventFactory(
@@ -1312,7 +1387,7 @@ class BallotContentTests(TestCase):
             balloter__plain='plain name3',
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now() - datetime.timedelta(days=1),
+            discuss_time=timezone.now() - datetime.timedelta(days=1),
             send_email=True,
         ).balloter
         BallotPositionDocEventFactory(
@@ -1320,7 +1395,7 @@ class BallotContentTests(TestCase):
             balloter=prev_send_email_balloter,
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=False,
         )
 
@@ -1351,7 +1426,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[0],
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=None,
         )
         BallotPositionDocEventFactory(
@@ -1359,7 +1434,7 @@ class BallotContentTests(TestCase):
             balloter=balloters[1],
             pos_id='noobj',
             comment='Commentary',
-            comment_time=datetime.datetime.now(),
+            comment_time=timezone.now(),
             send_email=None,
         )
         old_balloter = BallotPositionDocEventFactory(
@@ -1367,7 +1442,7 @@ class BallotContentTests(TestCase):
             balloter__plain='plain name',  # ensure plain name is slugifiable
             pos_id='discuss',
             discuss='Discussion text',
-            discuss_time=datetime.datetime.now(),
+            discuss_time=timezone.now(),
             send_email=None,
         ).balloter
 
@@ -1377,6 +1452,31 @@ class BallotContentTests(TestCase):
             ballot_id=ballot.pk,
         )
         q = PyQuery(content)
-        self._assertBallotMessage(q, balloters[0], 'No email send requests for this discuss')
-        self._assertBallotMessage(q, balloters[1], 'No ballot position send log available')
+        self._assertBallotMessage(q, balloters[0], 'No discuss send log available')
+        self._assertBallotMessage(q, balloters[1], 'No comment send log available')
         self._assertBallotMessage(q, old_balloter, 'No ballot position send log available')
+
+class ReturnToUrlTests(TestCase):
+    def test_invalid_return_to_url(self):
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('/', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('/a-route-that-does-not-exist/', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('https://example.com/phishing', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+    def test_valid_default_return_to_url(self):
+        self.assertEqual(parse_ballot_edit_return_point(
+            None,
+            'draft-ietf-opsawg-ipfix-tcpo-v6eh',
+            '998718'
+        ), '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/')
+        
+    def test_valid_return_to_url(self):
+        self.assertEqual(parse_ballot_edit_return_point(
+            '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/',
+            'draft-ietf-opsawg-ipfix-tcpo-v6eh',
+            '998718'
+        ), '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/')

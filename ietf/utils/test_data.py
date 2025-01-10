@@ -6,20 +6,23 @@ import datetime
 
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.utils.encoding import smart_text
+from django.utils import timezone
+from django.utils.encoding import smart_str
 
 import debug                            # pyflakes:ignore
 
-from ietf.doc.models import Document, DocAlias, State, DocumentAuthor, DocEvent, RelatedDocument, NewRevisionDocEvent
+from ietf.doc.models import Document, State, DocumentAuthor, DocEvent, RelatedDocument, NewRevisionDocEvent
+from ietf.doc.factories import IndividualDraftFactory, ConflictReviewFactory, StatusChangeFactory, WgDraftFactory, WgRfcFactory
 from ietf.group.models import Group, GroupHistory, Role, RoleHistory
 from ietf.iesg.models import TelechatDate
 from ietf.ipr.models import HolderIprDisclosure, IprDocRel, IprDisclosureStateName, IprLicenseTypeName
 from ietf.meeting.models import Meeting, ResourceAssociation
-from ietf.name.models import StreamName, DocRelationshipName, RoomResourceName, ConstraintName
+from ietf.name.models import DocRelationshipName, RoomResourceName, ConstraintName
 from ietf.person.models import Person, Email
 from ietf.group.utils import setup_default_community_list_for_group
 from ietf.review.models import (ReviewRequest, ReviewerSettings, ReviewResultName, ReviewTypeName, ReviewTeamSettings )
 from ietf.person.name import unidecode_name
+from ietf.utils.timezone import date_today
 
 
 def create_person(group, role_name, name=None, username=None, email_address=None, password=None, is_staff=False, is_superuser=False):
@@ -36,7 +39,7 @@ def create_person(group, role_name, name=None, username=None, email_address=None
     user = User.objects.create(username=username,is_staff=is_staff,is_superuser=is_superuser)
     user.set_password(password)
     user.save()
-    person = Person.objects.create(name=name, ascii=unidecode_name(smart_text(name)), user=user)
+    person = Person.objects.create(name=name, ascii=unidecode_name(smart_str(name)), user=user)
     email = Email.objects.create(address=email_address, person=person, origin=user.username)
     Role.objects.create(group=group, name_id=role_name, person=person, email=email)
     return person
@@ -51,7 +54,7 @@ def make_immutable_base_data():
     all tests in a run."""
 
     # telechat dates
-    t = datetime.date.today() + datetime.timedelta(days=1)
+    t = date_today() + datetime.timedelta(days=1)
     old = TelechatDate.objects.create(date=t - datetime.timedelta(days=14)).date        # pyflakes:ignore
     date1 = TelechatDate.objects.create(date=t).date                                    # pyflakes:ignore
     date2 = TelechatDate.objects.create(date=t + datetime.timedelta(days=14)).date      # pyflakes:ignore
@@ -70,6 +73,10 @@ def make_immutable_base_data():
     irtf = create_group(name="IRTF", acronym="irtf", type_id="irtf")
     create_person(irtf, "chair")
 
+    rsab = create_group(name="RSAB", acronym="rsab", type_id="edappr")
+    p = create_person(rsab, "chair")
+    p.role_set.create(group=rsab, name_id="member", email=p.email())
+
     secretariat = create_group(name="IETF Secretariat", acronym="secretariat", type_id="ietf")
     create_person(secretariat, "secr", name="Sec Retary", username="secretary", is_staff=True, is_superuser=True)
 
@@ -77,7 +84,7 @@ def make_immutable_base_data():
     create_person(iab, "chair")
     create_person(iab, "member")
 
-    ise = create_group(name="Independent Submission Editor", acronym="ise", type_id="rfcedtyp")
+    ise = create_group(name="Independent Submission Editor", acronym="ise", type_id="ise")
     create_person(ise, "chair")
 
     rsoc = create_group(name="RFC Series Oversight Committee", acronym="rsoc", type_id="rfcedtyp")
@@ -170,7 +177,6 @@ def make_test_data():
     charter.set_state(State.objects.get(used=True, slug="approved", type="charter"))
     group.charter = charter
     group.save()
-    DocAlias.objects.create(name=charter.name).docs.add(charter)
     setup_default_community_list_for_group(group)
 
     # ames WG
@@ -192,7 +198,6 @@ def make_test_data():
         rev="00",
         )
     charter.set_state(State.objects.get(used=True, slug="infrev", type="charter"))
-    DocAlias.objects.create(name=charter.name).docs.add(charter)
     group.charter = charter
     group.save()
     setup_default_community_list_for_group(group)
@@ -237,7 +242,6 @@ def make_test_data():
     #    rev="00",
     #    )
     #charter.set_state(State.objects.get(used=True, slug="infrev", type="charter"))
-    #DocAlias.objects.create(name=charter.name).docs.add(charter)
     #group.charter = charter
     #group.save()
 
@@ -271,23 +275,21 @@ def make_test_data():
     # old draft
     old_draft = Document.objects.create(
         name="draft-foo-mars-test",
-        time=datetime.datetime.now() - datetime.timedelta(days=settings.INTERNET_DRAFT_DAYS_TO_EXPIRE),
+        time=timezone.now() - datetime.timedelta(days=settings.INTERNET_DRAFT_DAYS_TO_EXPIRE),
         type_id="draft",
         title="Optimizing Martian Network Topologies",
         stream_id="ietf",
         abstract="Techniques for achieving near-optimal Martian networks.",
         rev="00",
         pages=2,
-        expires=datetime.datetime.now(),
+        expires=timezone.now(),
         )
     old_draft.set_state(State.objects.get(used=True, type="draft", slug="expired"))
-    old_alias = DocAlias.objects.create(name=old_draft.name)
-    old_alias.docs.add(old_draft)
 
     # draft
     draft = Document.objects.create(
         name="draft-ietf-mars-test",
-        time=datetime.datetime.now(),
+        time=timezone.now(),
         type_id="draft",
         title="Optimizing Martian Network Topologies",
         stream_id="ietf",
@@ -298,19 +300,15 @@ def make_test_data():
         intended_std_level_id="ps",
         shepherd=email,
         ad=ad,
-        expires=datetime.datetime.now() + datetime.timedelta(days=settings.INTERNET_DRAFT_DAYS_TO_EXPIRE),
+        expires=timezone.now() + datetime.timedelta(days=settings.INTERNET_DRAFT_DAYS_TO_EXPIRE),
         notify="aliens@example.mars",
-        note="",
         )
 
     draft.set_state(State.objects.get(used=True, type="draft", slug="active"))
     draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="pub-req"))
     draft.set_state(State.objects.get(used=True, type="draft-stream-%s" % draft.stream_id, slug="wg-doc"))
 
-    doc_alias = DocAlias.objects.create(name=draft.name)
-    doc_alias.docs.add(draft)
-
-    RelatedDocument.objects.create(source=draft, target=old_alias, relationship=DocRelationshipName.objects.get(slug='replaces'))
+    RelatedDocument.objects.create(source=draft, target=old_draft, relationship=DocRelationshipName.objects.get(slug='replaces'))
     old_draft.set_state(State.objects.get(type='draft', slug='repl'))
 
     DocumentAuthor.objects.create(
@@ -345,7 +343,7 @@ def make_test_data():
         title="Statement regarding rights",
         holder_legal_name="Native Martians United",
         state=IprDisclosureStateName.objects.get(slug='posted'),
-        patent_info='Number: US12345\nTitle: A method of transfering bits\nInventor: A. Nonymous\nDate: 2000-01-01',
+        patent_info='Number: US12345\nTitle: A method of transferring bits\nInventor: A. Nonymous\nDate: 2000-01-01',
         holder_contact_name='George',
         holder_contact_email='george@acme.com',
         holder_contact_info='14 Main Street\nEarth',
@@ -356,7 +354,7 @@ def make_test_data():
 
     IprDocRel.objects.create(
         disclosure=ipr,
-        document=doc_alias,
+        document=draft,
         revisions='00',
         )
     
@@ -364,7 +362,7 @@ def make_test_data():
     ietf72 = Meeting.objects.create(
         number="72",
         type_id="ietf",
-        date=datetime.date.today() + datetime.timedelta(days=180),
+        date=date_today() + datetime.timedelta(days=180),
         city="New York",
         country="US",
         time_zone="US/Eastern",
@@ -385,37 +383,27 @@ def make_test_data():
         )
 
     # an independent submission before review
-    doc = Document.objects.create(name='draft-imaginary-independent-submission',type_id='draft',rev='00',
-        title="Some Independent Notes on Imagination")
-    doc.set_state(State.objects.get(used=True, type="draft", slug="active"))    
-    DocAlias.objects.create(name=doc.name).docs.add(doc)
+    IndividualDraftFactory(title="Some Independent Notes on Imagination")
 
     # an irtf submission mid review
-    doc = Document.objects.create(name='draft-imaginary-irtf-submission', type_id='draft',rev='00',
-        stream=StreamName.objects.get(slug='irtf'), title="The Importance of Research Imagination")
-    docalias = DocAlias.objects.create(name=doc.name)
-    docalias.docs.add(doc)
-    doc.set_state(State.objects.get(type="draft", slug="active"))
-    crdoc = Document.objects.create(name='conflict-review-imaginary-irtf-submission', type_id='conflrev',
-        rev='00', notify="fsm@ietf.org", title="Conflict Review of IRTF Imagination Document")
-    DocAlias.objects.create(name=crdoc.name).docs.add(crdoc)
-    crdoc.set_state(State.objects.get(name='Needs Shepherd', type__slug='conflrev'))
-    crdoc.relateddocument_set.create(target=docalias,relationship_id='conflrev')
+    doc = IndividualDraftFactory(name="draft-imaginary-irtf-submission", stream_id="irtf", title="The Importance of Research Imagination")
+    ConflictReviewFactory(name="conflict-review-imaginary-irtf-submission", review_of=doc, notify="fsm@ietf.org", title="Conflict Review of IRTF Imagination Document")
     
     # A status change mid review
     iesg = Group.objects.get(acronym='iesg')
-    doc = Document.objects.create(name='status-change-imaginary-mid-review',type_id='statchg', rev='00',
-        notify="fsm@ietf.org", group=iesg, title="Status Change Review without Imagination")
-    doc.set_state(State.objects.get(slug='needshep',type__slug='statchg'))
-    docalias = DocAlias.objects.create(name='status-change-imaginary-mid-review')
-    docalias.docs.add(doc)
+    doc = StatusChangeFactory(
+        name='status-change-imaginary-mid-review',
+        notify="fsm@ietf.org", 
+        group=iesg, 
+        title="Status Change Review without Imagination",
+        states= [State.objects.get(type_id="statchg",slug="needshep")]
+    )
 
     # Some things for a status change to affect
     def rfc_for_status_change_test_factory(name,rfc_num,std_level_id):
-        target_rfc = Document.objects.create(name=name, type_id='draft', std_level_id=std_level_id, notify="%s@ietf.org"%name)
-        target_rfc.set_state(State.objects.get(slug='rfc',type__slug='draft'))
-        DocAlias.objects.create(name=name).docs.add(target_rfc)
-        DocAlias.objects.create(name='rfc%d'%rfc_num).docs.add(target_rfc)
+        target_rfc = WgRfcFactory(rfc_number=rfc_num, std_level_id=std_level_id)
+        source_draft = WgDraftFactory(name=name, states=[("draft","rfc")], notify=f"{name}@ietf.org")
+        source_draft.relateddocument_set.create(relationship_id="became_rfc", target=target_rfc)
         return target_rfc
     rfc_for_status_change_test_factory('draft-ietf-random-thing',9999,'ps')
     rfc_for_status_change_test_factory('draft-ietf-random-otherthing',9998,'inf')
@@ -458,7 +446,7 @@ def make_review_data(doc):
         doc=doc,
         team=team1,
         type_id="early",
-        deadline=datetime.datetime.now() + datetime.timedelta(days=20),
+        deadline=timezone.now() + datetime.timedelta(days=20),
         state_id="accepted",
         requested_by=reviewer,
         reviewer=email,

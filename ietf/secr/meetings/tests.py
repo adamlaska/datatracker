@@ -3,17 +3,13 @@
 
 
 import datetime
-import os
-import shutil
 
-from pathlib import Path
 from pyquery import PyQuery
-from io import StringIO
 
 import debug         # pyflakes:ignore
 
-from django.conf import settings
 from django.urls import reverse
+from django.utils import timezone
 
 from ietf.group.models import Group, GroupEvent
 from ietf.meeting.factories import MeetingFactory
@@ -28,24 +24,6 @@ from ietf.utils.test_utils import TestCase
 
 class SecrMeetingTestCase(TestCase):
     settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['AGENDA_PATH']
-    def setUp(self):
-        super().setUp()
-        self.bluesheet_dir = self.tempdir('bluesheet')
-        self.bluesheet_path = os.path.join(self.bluesheet_dir,'blue_sheet.rtf')
-        self.saved_secr_blue_sheet_path = settings.SECR_BLUE_SHEET_PATH
-        settings.SECR_BLUE_SHEET_PATH = self.bluesheet_path
-
-        # n.b., the bluesheet upload relies on SECR_PROCEEDINGS_DIR being the same
-        # as AGENDA_PATH. This is probably a bug, but may not be worth fixing if
-        # the secr app is on the way out.
-        self.saved_secr_proceedings_dir = settings.SECR_PROCEEDINGS_DIR
-        settings.SECR_PROCEEDINGS_DIR = settings.AGENDA_PATH
-
-    def tearDown(self):
-        settings.SECR_PROCEEDINGS_DIR = self.saved_secr_proceedings_dir
-        settings.SECR_BLUE_SHEET_PATH = self.saved_secr_blue_sheet_path
-        shutil.rmtree(self.bluesheet_dir)
-        super().tearDown()
 
     def test_main(self):
         "Main Test"
@@ -104,6 +82,10 @@ class SecrMeetingTestCase(TestCase):
             [cn.slug for cn in new_meeting.group_conflict_types.all()],
             post_data['group_conflict_types'],
         )
+        self.assertEqual(
+            new_meeting.session_request_lock_message, 
+            "Session requests for this meeting have not yet opened.",
+        )
 
     def test_add_meeting_default_conflict_types(self):
         """Add meeting should default to same conflict types as previous meeting"""
@@ -137,7 +119,10 @@ class SecrMeetingTestCase(TestCase):
         "Edit Meeting"
         meeting = make_meeting_test_data()
         url = reverse('ietf.secr.meetings.views.edit_meeting',kwargs={'meeting_id':meeting.number})
-        post_data = dict(number=meeting.number,date='2014-07-20',city='Toronto',
+        post_data = dict(number=meeting.number,
+                         date='2014-07-20',
+                         city='Toronto',
+                         time_zone='America/Toronto',
                          days=7,
                          idsubmit_cutoff_day_offset_00=13,
                          idsubmit_cutoff_day_offset_01=20,
@@ -166,34 +151,6 @@ class SecrMeetingTestCase(TestCase):
             [cn.slug for cn in meeting.group_conflict_types.all()],
             post_data['group_conflict_types'],
         )
-
-    def test_blue_sheets_upload(self):
-        "Test Bluesheets"
-        meeting = make_meeting_test_data()
-        (Path(settings.SECR_PROCEEDINGS_DIR) / str(meeting.number) / 'bluesheets').mkdir(parents=True)
-
-        url = reverse('ietf.secr.meetings.views.blue_sheet',kwargs={'meeting_id':meeting.number})
-        self.client.login(username="secretary", password="secretary+password")
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 200)
-        
-        # test upload
-        group = Group.objects.filter(type='wg',state='active').first()
-        file = StringIO('dummy bluesheet')
-        file.name = "bluesheets-%s-%s.pdf" % (meeting.number,group.acronym)
-        files = {'file':file}
-        response = self.client.post(url, files)
-        self.assertEqual(response.status_code, 302)
-        path = os.path.join(settings.SECR_PROCEEDINGS_DIR,str(meeting.number),'bluesheets')
-        self.assertEqual(len(os.listdir(path)),1)
-
-    def test_blue_sheets_generate(self):
-        meeting = make_meeting_test_data()
-        url = reverse('ietf.secr.meetings.views.blue_sheet_generate',kwargs={'meeting_id':meeting.number})
-        self.client.login(username="secretary", password="secretary+password")
-        response = self.client.post(url)
-        self.assertEqual(response.status_code, 302)
-        self.assertTrue(os.path.exists(self.bluesheet_path))
         
     def test_notifications(self):
         "Test Notifications"
@@ -212,8 +169,8 @@ class SecrMeetingTestCase(TestCase):
         self.assertEqual(q('#id_notification_list').html(),'ames, mars')
 
         # test that only changes since last notification show up
-        now = datetime.datetime.now()
-        then = datetime.datetime.now()+datetime.timedelta(hours=1)
+        now = timezone.now()
+        then = timezone.now()+datetime.timedelta(hours=1)
         person = Person.objects.get(name="(System)")
         GroupEvent.objects.create(group=mars_group,time=now,type='sent_notification',
                                   by=person,desc='sent scheduled notification for %s' % meeting)
@@ -285,7 +242,7 @@ class SecrMeetingTestCase(TestCase):
         url = reverse('ietf.secr.meetings.views.times_delete',kwargs={
             'meeting_id':meeting.number,
             'schedule_name':meeting.schedule.name,
-            'time':qs.first().time.strftime("%Y:%m:%d:%H:%M")
+            'time':qs.first().time.astimezone(meeting.tz()).strftime("%Y:%m:%d:%H:%M")
         })
         redirect_url = reverse('ietf.secr.meetings.views.times',kwargs={
             'meeting_id':meeting.number,
@@ -305,7 +262,7 @@ class SecrMeetingTestCase(TestCase):
         url = reverse('ietf.secr.meetings.views.times_edit',kwargs={
             'meeting_id':72,
             'schedule_name':'test-schedule',
-            'time':timeslot.time.strftime("%Y:%m:%d:%H:%M")
+            'time':timeslot.time.astimezone(meeting.tz()).strftime("%Y:%m:%d:%H:%M")
         })
         self.client.login(username="secretary", password="secretary+password")
         response = self.client.post(url, {
@@ -371,7 +328,7 @@ class SecrMeetingTestCase(TestCase):
         timeslot = session.official_timeslotassignment().timeslot
         url = reverse('ietf.secr.meetings.views.misc_session_edit',kwargs={'meeting_id':72,'schedule_name':meeting.schedule.name,'slot_id':timeslot.pk})
         redirect_url = reverse('ietf.secr.meetings.views.misc_sessions',kwargs={'meeting_id':72,'schedule_name':'test-schedule'})
-        new_time = timeslot.time + datetime.timedelta(days=1)
+        new_time = (timeslot.time + datetime.timedelta(days=1)).astimezone(meeting.tz())
         self.client.login(username="secretary", password="secretary+password")
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
@@ -388,8 +345,9 @@ class SecrMeetingTestCase(TestCase):
             'remote_instructions': 'http://webex.com/foobar',
         })
         self.assertRedirects(response, redirect_url)
+        session = Session.objects.get(pk=session.pk)  # get a clean instance to avoid cache problems
         timeslot = session.official_timeslotassignment().timeslot
-        self.assertEqual(timeslot.time,new_time)
+        self.assertEqual(timeslot.time, new_time)
 
     def test_meetings_misc_session_delete(self):
         meeting = make_meeting_test_data()

@@ -166,6 +166,15 @@ class TimeSlotForm(forms.Form):
         for n in range(-self.meeting.days, self.meeting.days):
             date = start + datetime.timedelta(days=n)
             choices.append((n, date.strftime("%a %b %d")))
+        # make sure the choices include the initial day
+        if self.initial and 'day' in self.initial:
+            day = self.initial['day']
+            date = start + datetime.timedelta(days=day)
+            datestr = date.strftime("%a %b %d")
+            if day < -self.meeting.days:
+                choices.insert(0, (day, datestr))
+            elif day >= self.meeting.days:
+                choices.append((day, datestr))
         return choices
 
 
@@ -229,17 +238,8 @@ class MiscSessionForm(TimeSlotForm):
             raise forms.ValidationError("ERROR: can't change group after materials have been uploaded")
         return group
 
-class UploadBlueSheetForm(forms.Form):
-    file = forms.FileField(help_text='example: bluesheets-84-ancp-01.pdf')
-    
-    def clean_file(self):
-        file = self.cleaned_data['file']
-        if not re.match(r'bluesheets-\d+',file.name):
-            raise forms.ValidationError('Incorrect filename format')
-        return file
 
 class RegularSessionEditForm(forms.ModelForm):
     class Meta:
         model = Session
         fields = ['agenda_note']
-

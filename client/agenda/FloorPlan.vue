@@ -5,7 +5,6 @@
       span #[strong IETF {{agendaStore.meeting.number}}] Floor Plan
       .meeting-h1-badges.d-none.d-sm-flex
         span.meeting-warning(v-if='agendaStore.meeting.warningNote') {{agendaStore.meeting.warningNote}}
-        span.meeting-beta BETA
     h4
       span {{agendaStore.meeting.city}}, {{ meetingDate }}
 
@@ -188,10 +187,10 @@ function handleDesiredRoom () {
       if (rm) {
         state.currentFloor = fl.id
         state.currentRoom = rm.id
+        state.desiredRoom = null
         break
       }
     }
-    state.desiredRoom = null
   }
 }
 
@@ -258,6 +257,11 @@ onMounted(() => {
     border: 1px solid $gray-300;
     border-radius: 5px;
     font-weight: 500;
+
+    @at-root .theme-dark & {
+      background-color: darken($gray-900, 5%);
+      border-color: $gray-700;
+    }
 
     a {
       cursor: pointer;

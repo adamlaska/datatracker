@@ -2,14 +2,14 @@
 {# Copyright The IETF Trust 2020, All Rights Reserved #}
 {% load origin %}
 {% load ietf_filters %}
-{% load django_bootstrap5 %}
+{% load django_bootstrap5 tz %}
 {% block title %}Differences between Meeting Agendas for IETF {{ meeting.number }}{% endblock %}
 {% block content %}
     {% origin %}
     <h1>
         Differences between Meeting Agendas
         <br>
-        <small class="text-muted">IETF {{ meeting.number }}</small>
+        <small class="text-body-secondary">IETF {{ meeting.number }}</small>
     </h1>
     <form method="get" class="my-3">
         {% bootstrap_form form layout="horizontal" %}
@@ -26,7 +26,7 @@
                         <th scope="col"></th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody>{% timezone meeting.time_zone %}
                     {% for d in diffs %}
                         <tr>
                             <td>
@@ -40,7 +40,7 @@
                             </td>
                         </tr>
                     {% endfor %}
-                </tbody>
+                {% endtimezone %}</tbody>
             </table>
         {% else %}
             No differences in scheduled sessions found.

@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2016-2020, All Rights Reserved
+# Copyright The IETF Trust 2016-2023, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
@@ -12,6 +12,8 @@ from django.template.defaultfilters import pluralize
 from django.template.loader import render_to_string
 from django.urls import reverse as urlreverse
 from django.contrib.sites.models import Site
+from django.utils import timezone
+
 from simple_history.utils import update_change_reason
 
 import debug                            # pyflakes:ignore
@@ -30,6 +32,8 @@ from ietf.review.models import (ReviewRequest, ReviewAssignment, ReviewRequestSt
 from ietf.utils.mail import send_mail
 from ietf.doc.utils import extract_complete_replaces_ancestor_mapping_for_docs
 from ietf.utils import log
+from ietf.utils.timezone import date_today, datetime_today, DEADLINE_TZINFO
+
 
 # The origin date is used to have a single reference date for "every X days".
 # This date is arbitrarily chosen and has no special meaning, but should be consistent.
@@ -46,6 +50,8 @@ def can_request_review_of_doc(user, doc):
     if not user.is_authenticated:
         return False
 
+    # This is in a strange place as it has nothing to do with the user
+    # but this utility is used in too many places to move this quickly.
     if doc.type_id == 'draft' and doc.get_state_slug() != 'active':
         return False
 
@@ -75,6 +81,11 @@ def review_assignments_to_list_for_docs(docs):
 
     return extract_revision_ordered_review_assignments_for_documents_and_replaced(assignment_qs, doc_names)
 
+def review_requests_to_list_for_docs(docs):
+    review_requests_qs = ReviewRequest.objects.filter(Q(state_id='requested'))
+    doc_names = [d.name for d in docs]
+    return extract_revision_ordered_review_requests_for_documents_and_replaced(review_requests_qs, doc_names)
+
 def augment_review_requests_with_events(review_reqs):
     req_dict = { r.pk: r for r in review_reqs }
     for e in ReviewRequestDocEvent.objects.filter(review_request__in=review_reqs, type__in=["assigned_review_request", "closed_review_request"]).order_by("time"):
@@ -89,12 +100,12 @@ def no_review_from_teams_on_doc(doc, rev):
 
 def unavailable_periods_to_list(past_days=14):
     return UnavailablePeriod.objects.filter(
-        Q(end_date=None) | Q(end_date__gte=datetime.date.today() - datetime.timedelta(days=past_days)),
+        Q(end_date=None) | Q(end_date__gte=date_today() - datetime.timedelta(days=past_days)),
     ).order_by("start_date")
 
 def current_unavailable_periods_for_reviewers(team):
     """Return dict with currently active unavailable periods for reviewers."""
-    today = datetime.date.today()
+    today = date_today()
 
     unavailable_period_qs = UnavailablePeriod.objects.filter(
         Q(end_date__gte=today) | Q(end_date=None),
@@ -119,7 +130,7 @@ def days_needed_to_fulfill_min_interval_for_reviewers(team):
 
     min_intervals = dict(ReviewerSettings.objects.filter(team=team).values_list("person_id", "min_interval"))
 
-    now = datetime.datetime.now()
+    now = timezone.now()
 
     res = {}
     for person_id, latest_assignment_time in latest_assignments.items():
@@ -192,7 +203,10 @@ def extract_review_assignment_data(teams=None, reviewers=None, time_from=None, t
         assigned_time = assigned_on
         closed_time = completed_on
 
-        late_days = positive_days(datetime.datetime.combine(deadline, datetime.time.max), closed_time)
+        late_days = positive_days(
+            datetime.datetime.combine(deadline, datetime.time.max, tzinfo=DEADLINE_TZINFO),
+            closed_time,
+        )
         request_to_assignment_days = positive_days(requested_time, assigned_time)
         assignment_to_closure_days = positive_days(assigned_time, closed_time)
         request_to_closure_days = positive_days(requested_time, closed_time)
@@ -283,7 +297,7 @@ def latest_review_assignments_for_reviewers(team, days_back=365):
 
     extracted_data = extract_review_assignment_data(
         teams=[team],
-        time_from=datetime.date.today() - datetime.timedelta(days=days_back),
+        time_from=datetime_today(DEADLINE_TZINFO) - datetime.timedelta(days=days_back),
         ordering=["reviewer"],
     )
 
@@ -301,7 +315,7 @@ def email_review_assignment_change(request, review_assignment, subject, msg, by,
         doc=review_assignment.review_request.doc,
         group=review_assignment.review_request.team,
         review_assignment=review_assignment,
-        skip_review_secretary=not notify_secretary,
+        skip_secretary=not notify_secretary,
         skip_review_reviewer=not notify_reviewer,
         skip_review_requested_by=not notify_requested_by,
     )
@@ -321,11 +335,11 @@ def email_review_request_change(request, review_req, subject, msg, by, notify_se
     was done by that party."""    
     (to, cc) = gather_address_lists(
         'review_req_changed',
-        skipped_recipients=[Person.objects.get(name="(System)").formatted_email(), by.email_address()],
+        skipped_recipients=[Person.objects.get(name="(System)").formatted_email()],
         doc=review_req.doc,
         group=review_req.team,
         review_request=review_req,
-        skip_review_secretary=not notify_secretary,
+        skip_secretary=not notify_secretary,
         skip_review_reviewer=not notify_reviewer,
         skip_review_requested_by=not notify_requested_by,
     )
@@ -375,8 +389,13 @@ def assign_review_request_to_reviewer(request, review_req, reviewer, add_skip=Fa
     # with a different view on a ReviewAssignment.
     log.assertion('reviewer is not None')
 
-    if review_req.reviewassignment_set.filter(reviewer=reviewer).exists():
-        return
+    # cannot reference reviewassignment_set relation until pk exists
+    if review_req.pk is not None:
+        reviewassignment_set = review_req.reviewassignment_set.filter(reviewer=reviewer)
+        if (reviewassignment_set.exists() and not
+            (reviewassignment_set.filter(state_id='rejected').exists() or
+             reviewassignment_set.filter(state_id='withdrawn').exists())):
+            return
 
     # Note that assigning a review no longer unassigns other reviews
 
@@ -391,15 +410,6 @@ def assign_review_request_to_reviewer(request, review_req, reviewer, add_skip=Fa
             review_req.team.acronym.upper(),
             reviewer.person if reviewer else "(None)")
     update_change_reason(assignment, descr)
-    ReviewRequestDocEvent.objects.create(
-        type="assigned_review_request",
-        doc=review_req.doc,
-        rev=review_req.doc.rev,
-        by=request.user.person,
-        desc=descr,
-        review_request=review_req,
-        state_id='assigned',
-    )
 
     ReviewAssignmentDocEvent.objects.create(
         type="assigned_review_request",
@@ -409,7 +419,7 @@ def assign_review_request_to_reviewer(request, review_req, reviewer, add_skip=Fa
         desc="Request for {} review by {} is assigned to {}".format(
             review_req.type.name,
             review_req.team.acronym.upper(),
-            reviewer.person,
+            reviewer.person if reviewer else "(None)",
         ),
         review_assignment=assignment,
         state_id='assigned',
@@ -432,9 +442,9 @@ def assign_review_request_to_reviewer(request, review_req, reviewer, add_skip=Fa
 
     email_review_request_change(
         request, review_req,
-        "%s %s assignment: %s" % (review_req.team.acronym.capitalize(), review_req.type.name,review_req.doc.name),
+        "For %s, %s %s review by %s assigned: %s" % (reviewer.person.name, review_req.team.acronym.capitalize(), review_req.type.name, review_req.deadline, review_req.doc.name),
         msg ,
-        by=request.user.person, notify_secretary=False, notify_reviewer=True, notify_requested_by=False)
+        by=request.user.person, notify_secretary=True, notify_reviewer=True, notify_requested_by=True)
 
 
 def close_review_request(request, review_req, close_state, close_comment=''):
@@ -495,7 +505,7 @@ def suggested_review_requests_for_team(team):
 
     requests = {}
 
-    now = datetime.datetime.now()
+    now = timezone.now().astimezone(DEADLINE_TZINFO)
 
     reviewable_docs_qs = Document.objects.filter(type="draft").exclude(stream="ise")
 
@@ -511,7 +521,7 @@ def suggested_review_requests_for_team(team):
         for doc in last_call_docs:
             e = last_call_expiry_events[doc.pk] if doc.pk in last_call_expiry_events else LastCallDocEvent(expires=now, time=now)
 
-            deadline = e.expires.date()
+            deadline = e.expires.astimezone(DEADLINE_TZINFO).date()
 
             if deadline > seen_deadlines.get(doc.pk, datetime.date.max) or deadline < now.date():
                 continue
@@ -590,17 +600,21 @@ def suggested_review_requests_for_team(team):
                    and existing.reviewassignment_set.filter(state_id__in=("assigned", "accepted")).exists()
                    and (not existing.requested_rev or existing.requested_rev == request.doc.rev))
         request_closed = existing.state_id not in ('requested','assigned')
+        # Is there a review request for this document already in system
+        requested = existing.state_id in ('requested') and (not existing.requested_rev or existing.requested_rev == request.doc.rev)
         # at least one assignment was completed for the requested version or the current doc version if no specific version was requested:
         some_assignment_completed = existing.reviewassignment_set.filter(reviewed_rev=existing.requested_rev or existing.doc.rev, state_id='completed').exists()
 
-        return any([no_review_document, no_review_rev, pending, request_closed, some_assignment_completed])
+        return any([no_review_document, no_review_rev, pending, request_closed, requested, some_assignment_completed])
 
     res = [r for r in requests.values()
            if not any(blocks(e, r) for e in existing_requests[r.doc_id])]
     res.sort(key=lambda r: (r.deadline, r.doc_id), reverse=True)
     return res
 
-def extract_revision_ordered_review_assignments_for_documents_and_replaced(review_assignment_queryset, names):
+def extract_revision_ordered_review_assignments_for_documents_and_replaced(
+    review_assignment_queryset, names
+):
     """Extracts all review assignments for document names (including replaced ancestors), return them neatly sorted."""
 
     names = set(names)
@@ -609,8 +623,13 @@ def extract_revision_ordered_review_assignments_for_documents_and_replaced(revie
 
     assignments_for_each_doc = defaultdict(list)
     replacement_name_set = set(e for l in replaces.values() for e in l) | names
-    for r in ( review_assignment_queryset.filter(review_request__doc__name__in=replacement_name_set)
-                                        .order_by("-reviewed_rev","-assigned_on", "-id").iterator()):
+    for r in (
+        review_assignment_queryset.filter(
+            review_request__doc__name__in=replacement_name_set
+        )
+        .order_by("-reviewed_rev", "-assigned_on", "-id")
+        .iterator(chunk_size=2000)  # chunk_size not tested, using pre-Django 5 default value
+    ):
         assignments_for_each_doc[r.review_request.doc.name].append(r)
 
     # now collect in breadth-first order to keep the revision order intact
@@ -648,7 +667,10 @@ def extract_revision_ordered_review_assignments_for_documents_and_replaced(revie
 
     return res
 
-def extract_revision_ordered_review_requests_for_documents_and_replaced(review_request_queryset, names):
+
+def extract_revision_ordered_review_requests_for_documents_and_replaced(
+    review_request_queryset, names
+):
     """Extracts all review requests for document names (including replaced ancestors), return them neatly sorted."""
 
     names = set(names)
@@ -656,7 +678,13 @@ def extract_revision_ordered_review_requests_for_documents_and_replaced(review_r
     replaces = extract_complete_replaces_ancestor_mapping_for_docs(names)
 
     requests_for_each_doc = defaultdict(list)
-    for r in review_request_queryset.filter(doc__name__in=set(e for l in replaces.values() for e in l) | names).order_by("-time", "-id").iterator():
+    for r in (
+        review_request_queryset.filter(
+            doc__name__in=set(e for l in replaces.values() for e in l) | names
+        )
+        .order_by("-time", "-id")
+        .iterator(chunk_size=2000)  # chunk_size not tested, using pre-Django 5 default value
+    ):
         requests_for_each_doc[r.doc.name].append(r)
 
     # now collect in breadth-first order to keep the revision order intact
@@ -870,7 +898,7 @@ def email_reviewer_reminder(assignment):
     review_request = assignment.review_request
     team = review_request.team
 
-    deadline_days = (review_request.deadline - datetime.date.today()).days
+    deadline_days = (review_request.deadline - date_today(DEADLINE_TZINFO)).days
 
     subject = "Reminder: deadline for review of {} in {} is {}".format(review_request.doc.name, team.acronym, review_request.deadline.isoformat())
 
@@ -936,7 +964,7 @@ def email_secretary_reminder(assignment, secretary_role):
     review_request = assignment.review_request
     team = review_request.team
 
-    deadline_days = (review_request.deadline - datetime.date.today()).days
+    deadline_days = (review_request.deadline - date_today(DEADLINE_TZINFO)).days
 
     subject = "Reminder: deadline for review of {} in {} is {}".format(review_request.doc.name, team.acronym, review_request.deadline.isoformat())
 

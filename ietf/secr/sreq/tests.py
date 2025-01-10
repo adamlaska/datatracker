@@ -13,9 +13,12 @@ from ietf.group.factories import GroupFactory, RoleFactory
 from ietf.meeting.models import Session, ResourceAssociation, SchedulingEvent, Constraint
 from ietf.meeting.factories import MeetingFactory, SessionFactory
 from ietf.name.models import ConstraintName, TimerangeName
+from ietf.person.factories import PersonFactory
 from ietf.person.models import Person
 from ietf.secr.sreq.forms import SessionForm
-from ietf.utils.mail import outbox, empty_outbox, get_payload_text
+from ietf.utils.mail import outbox, empty_outbox, get_payload_text, send_mail
+from ietf.utils.timezone import date_today
+
 
 from pyquery import PyQuery
 
@@ -23,7 +26,7 @@ SECR_USER='secretary'
 
 class SreqUrlTests(TestCase):
     def test_urls(self):
-        MeetingFactory(type_id='ietf',date=datetime.date.today())
+        MeetingFactory(type_id='ietf',date=date_today())
 
         self.client.login(username="secretary", password="secretary+password")
 
@@ -39,10 +42,10 @@ class SreqUrlTests(TestCase):
 
 class SessionRequestTestCase(TestCase):
     def test_main(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         SessionFactory.create_batch(2, meeting=meeting, status_id='sched')
         SessionFactory.create_batch(2, meeting=meeting, status_id='disappr')
-        # An additional unscheduled group comes from make_immutable_base_data
+        # Several unscheduled groups come from make_immutable_base_data
         url = reverse('ietf.secr.sreq.views.main')
         self.client.login(username="secretary", password="secretary+password")
         r = self.client.get(url)
@@ -50,10 +53,10 @@ class SessionRequestTestCase(TestCase):
         sched = r.context['scheduled_groups']
         self.assertEqual(len(sched), 2)
         unsched = r.context['unscheduled_groups']
-        self.assertEqual(len(unsched), 11)
+        self.assertEqual(len(unsched), 12)
 
     def test_approve(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = RoleFactory(name_id='ad', person=ad, group__type_id='area').group
         mars = GroupFactory(parent=area, acronym='mars')
@@ -66,7 +69,7 @@ class SessionRequestTestCase(TestCase):
         self.assertEqual(SchedulingEvent.objects.filter(session=session).order_by('-id')[0].status_id, 'appr')
         
     def test_cancel(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = RoleFactory(name_id='ad', person=ad, group__type_id='area').group
         session = SessionFactory(meeting=meeting, group__parent=area, group__acronym='mars', status_id='sched')
@@ -76,8 +79,34 @@ class SessionRequestTestCase(TestCase):
         self.assertRedirects(r,reverse('ietf.secr.sreq.views.main'))
         self.assertEqual(SchedulingEvent.objects.filter(session=session).order_by('-id')[0].status_id, 'deleted')
 
+    def test_cancel_notification_msg(self):
+        to = "<iesg-secretary@ietf.org>"
+        subject = "Dummy subject"
+        template = "sreq/session_cancel_notification.txt"
+        meeting = MeetingFactory(type_id="ietf", date=date_today())
+        requester = PersonFactory(name="James O'Rourke", user__username="jimorourke")
+        context = {"meeting": meeting, "requester": requester}
+        cc = "cc.a@example.com, cc.b@example.com"
+        bcc = "bcc@example.com"
+
+        msg = send_mail(
+            None,
+            to,
+            None,
+            subject,
+            template,
+            context,
+            cc=cc,
+            bcc=bcc,
+        )
+        self.assertEqual(requester.name, "James O'Rourke")  # note ' (single quote) in the name
+        self.assertIn(
+            f"A request to cancel a meeting session has just been submitted by {requester.name}.",
+            get_payload_text(msg),
+        )
+
     def test_edit(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         mars = RoleFactory(name_id='chair', person__user__username='marschairman', group__acronym='mars').group
         group2 = GroupFactory()
         group3 = GroupFactory()
@@ -144,7 +173,7 @@ class SessionRequestTestCase(TestCase):
         self.assertRedirects(r, redirect_url)
 
         # Check whether updates were stored in the database
-        sessions = Session.objects.filter(meeting=meeting, group=mars)
+        sessions = Session.objects.filter(meeting=meeting, group=mars).order_by("id")  # order to match edit() view
         self.assertEqual(len(sessions), 2)
         session = sessions[0]
 
@@ -156,14 +185,15 @@ class SessionRequestTestCase(TestCase):
             list(TimerangeName.objects.filter(name__in=['thursday-afternoon-early', 'thursday-afternoon-late']).values('name'))
         )
         self.assertFalse(sessions[0].joint_with_groups.count())
-        self.assertEqual(list(sessions[1].joint_with_groups.all()), [group3, group4])
+        self.assertEqual(set(sessions[1].joint_with_groups.all()), {group3, group4})
 
         # Check whether the updated data is visible on the view page
         r = self.client.get(redirect_url)
         self.assertContains(r, 'Schedule the sessions on subsequent days')
         self.assertContains(r, 'Thursday early afternoon, Thursday late afternoon')
         self.assertContains(r, group2.acronym)
-        self.assertContains(r, 'Second session with: {} {}'.format(group3.acronym, group4.acronym))
+        # The sessions can be in any order in the HTML, deal with that
+        self.assertRegex(r.content.decode(), r'Second session with: ({} {}|{} {})'.format(group3.acronym, group4.acronym, group4.acronym, group3.acronym))
 
         # check that a notification was sent
         self.assertEqual(len(outbox), 1)
@@ -242,7 +272,7 @@ class SessionRequestTestCase(TestCase):
 
 
     def test_edit_constraint_bethere(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         mars = RoleFactory(name_id='chair', person__user__username='marschairman', group__acronym='mars').group
         session = SessionFactory(meeting=meeting, group=mars, status_id='sched')
         Constraint.objects.create(
@@ -309,7 +339,7 @@ class SessionRequestTestCase(TestCase):
 
     def test_edit_inactive_conflicts(self):
         """Inactive conflicts should be displayed and removable"""
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today(), group_conflicts=['chair_conflict'])
+        meeting = MeetingFactory(type_id='ietf', date=date_today(), group_conflicts=['chair_conflict'])
         mars = RoleFactory(name_id='chair', person__user__username='marschairman', group__acronym='mars').group
         session = SessionFactory(meeting=meeting, group=mars, status_id='sched')
         other_group = GroupFactory()
@@ -367,7 +397,7 @@ class SessionRequestTestCase(TestCase):
         self.assertEqual(len(mars.constraint_source_set.filter(name_id='conflict')), 0)
 
     def test_tool_status(self):
-        MeetingFactory(type_id='ietf', date=datetime.date.today())
+        MeetingFactory(type_id='ietf', date=date_today())
         url = reverse('ietf.secr.sreq.views.tool_status')
         self.client.login(username="secretary", password="secretary+password")
         r = self.client.get(url)
@@ -381,7 +411,7 @@ class SessionRequestTestCase(TestCase):
         Relies on SessionForm representing constraint values with element IDs
         like id_constraint_<ConstraintName slug>
         """
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         RoleFactory(name_id='chair', person__user__username='marschairman', group__acronym='mars')
         url = reverse('ietf.secr.sreq.views.new', kwargs=dict(acronym='mars'))
         self.client.login(username="marschairman", password="marschairman+password")
@@ -404,7 +434,7 @@ class SessionRequestTestCase(TestCase):
 
     def test_edit_req_constraint_types(self):
         """Editing a request constraint should show the expected constraints"""
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         SessionFactory(group__acronym='mars',
                        status_id='schedw',
                        meeting=meeting,
@@ -438,7 +468,7 @@ class SubmitRequestCase(TestCase):
         MeetingFactory.reset_sequence(0)
 
     def test_submit_request(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = RoleFactory(name_id='ad', person=ad, group__type_id='area').group
         group = GroupFactory(parent=area)
@@ -503,10 +533,10 @@ class SubmitRequestCase(TestCase):
             list(session.constraints().get(name='timerange').timeranges.all().values('name')),
             list(TimerangeName.objects.filter(name__in=['thursday-afternoon-early', 'thursday-afternoon-late']).values('name'))
         )
-        self.assertEqual(list(session.joint_with_groups.all()), [group3, group4])
+        self.assertEqual(set(list(session.joint_with_groups.all())), set([group3, group4]))
 
     def test_submit_request_invalid(self):
-        MeetingFactory(type_id='ietf', date=datetime.date.today())
+        MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = RoleFactory(name_id='ad', person=ad, group__type_id='area').group
         group = GroupFactory(parent=area)
@@ -542,8 +572,8 @@ class SubmitRequestCase(TestCase):
         self.assertContains(r, 'Must provide data for all sessions')
 
     def test_submit_request_check_constraints(self):
-        m1 = MeetingFactory(type_id='ietf', date=datetime.date.today() - datetime.timedelta(days=100))
-        MeetingFactory(type_id='ietf', date=datetime.date.today(),
+        m1 = MeetingFactory(type_id='ietf', date=date_today() - datetime.timedelta(days=100))
+        MeetingFactory(type_id='ietf', date=date_today(),
                        group_conflicts=['chair_conflict', 'conflic2', 'conflic3'])
         ad = Person.objects.get(user__username='ad')
         area = RoleFactory(name_id='ad', person=ad, group__type_id='area').group
@@ -604,7 +634,7 @@ class SubmitRequestCase(TestCase):
         self.assertContains(r, "Cannot declare a conflict with the same group")
 
     def test_request_notification(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = GroupFactory(type_id='area')
         RoleFactory(name_id='ad', person=ad, group=area)
@@ -698,8 +728,35 @@ class SubmitRequestCase(TestCase):
         self.assertNotIn('1 Hour, 1 Hour, 1 Hour', notification_payload)
         self.assertNotIn('The third session requires your approval', notification_payload)
 
+    def test_request_notification_msg(self):
+        to = "<iesg-secretary@ietf.org>"
+        subject = "Dummy subject"
+        template = "sreq/session_request_notification.txt"
+        header = "A new"
+        meeting = MeetingFactory(type_id="ietf", date=date_today())
+        requester = PersonFactory(name="James O'Rourke", user__username="jimorourke")
+        context = {"header": header, "meeting": meeting, "requester": requester}
+        cc = "cc.a@example.com, cc.b@example.com"
+        bcc = "bcc@example.com"
+
+        msg = send_mail(
+            None,
+            to,
+            None,
+            subject,
+            template,
+            context,
+            cc=cc,
+            bcc=bcc,
+        )
+        self.assertEqual(requester.name, "James O'Rourke")  # note ' (single quote) in the name
+        self.assertIn(
+            f"{header} meeting session request has just been submitted by {requester.name}.",
+            get_payload_text(msg),
+        )
+
     def test_request_notification_third_session(self):
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date.today())
+        meeting = MeetingFactory(type_id='ietf', date=date_today())
         ad = Person.objects.get(user__username='ad')
         area = GroupFactory(type_id='area')
         RoleFactory(name_id='ad', person=ad, group=area)
@@ -807,7 +864,7 @@ class SubmitRequestCase(TestCase):
 class LockAppTestCase(TestCase):
     def setUp(self):
         super().setUp()
-        self.meeting = MeetingFactory(type_id='ietf', date=datetime.date.today(),session_request_lock_message='locked')
+        self.meeting = MeetingFactory(type_id='ietf', date=date_today(),session_request_lock_message='locked')
         self.group = GroupFactory(acronym='mars')
         RoleFactory(name_id='chair', group=self.group, person__user__username='marschairman')
         SessionFactory(group=self.group,meeting=self.meeting)
@@ -832,8 +889,14 @@ class LockAppTestCase(TestCase):
         r = self.client.get(url,follow=True)
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
-        self.assertEqual(len(q(':disabled[name="edit"]')), 1)
-        
+        self.assertEqual(len(q(':enabled[name="edit"]')), 1)  # secretary can edit
+        chair = self.group.role_set.filter(name_id='chair').first().person.user.username
+        self.client.login(username=chair, password=f'{chair}+password')
+        r = self.client.get(url,follow=True)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q(':disabled[name="edit"]')), 1)  # chair cannot edit
+
     def test_new_request(self):
         url = reverse('ietf.secr.sreq.views.new',kwargs={'acronym':self.group.acronym})
         
@@ -853,7 +916,7 @@ class LockAppTestCase(TestCase):
     
 class NotMeetingCase(TestCase):
     def test_not_meeting(self):
-        MeetingFactory(type_id='ietf',date=datetime.date.today())
+        MeetingFactory(type_id='ietf',date=date_today())
         group = GroupFactory(acronym='mars')
         url = reverse('ietf.secr.sreq.views.no_session',kwargs={'acronym':group.acronym}) 
         self.client.login(username="secretary", password="secretary+password")

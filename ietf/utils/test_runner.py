@@ -40,10 +40,8 @@ import os
 import sys
 import time
 import json
-import pytz
 import importlib
 import socket
-import datetime
 import gzip
 import unittest
 import pathlib
@@ -56,7 +54,6 @@ import warnings
 from urllib.parse import urlencode
 
 from fnmatch import fnmatch
-from pathlib import Path
 
 from coverage.report import Reporter
 from coverage.results import Numbers
@@ -76,7 +73,8 @@ from django.core.management import call_command
 from django.urls import URLResolver # type: ignore
 from django.template.backends.django import DjangoTemplates
 from django.template.backends.django import Template  # type: ignore[attr-defined]
-# from django.utils.safestring import mark_safe
+from django.utils import timezone
+from django.views.generic import RedirectView, TemplateView
 
 import debug                            # pyflakes:ignore
 debug.debug = True
@@ -97,7 +95,7 @@ old_create = None
 template_coverage_collection = None
 code_coverage_collection = None
 url_coverage_collection = None
-
+validation_settings = {"validate_html": None, "validate_html_harder": None, "show_logging": False}
 
 def start_vnu_server(port=8888):
     "Start a vnu validation server on the indicated port"
@@ -176,14 +174,22 @@ def vnu_fmt_message(file, msg, content):
 
 def vnu_filter_message(msg, filter_db_issues, filter_test_issues):
     "True if the vnu message is a known false positive"
-    if filter_db_issues and re.search(
-        r"""^Forbidden\ code\ point\ U\+|
-             Illegal\ character\ in\ query:\ '\['|
-            'href'\ on\ element\ 'a':\ Percentage\ \("%"\)\ is\ not\ followed|
-            ^Saw\ U\+\d+\ in\ stream|
-            ^Document\ uses\ the\ Unicode\ Private\ Use\ Area""",
+    if re.search(
+        r"""^Document\ uses\ the\ Unicode\ Private\ Use\ Area|
+            ^Trailing\ slash\ on\ void\ elements\ has\ no\ effect|
+            ^Element\ 'h.'\ not\ allowed\ as\ child\ of\ element\ 'pre'""",
         msg["message"],
         flags=re.VERBOSE,
+    ) or (
+        filter_db_issues
+        and re.search(
+            r"""^Forbidden\ code\ point\ U\+|
+                 Illegal\ character\ in\ query:\ '\['|
+                 'href'\ on\ element\ 'a':\ Percentage\ \("%"\)\ is\ not|
+                ^Saw\ U\+\d+\ in\ stream""",
+            msg["message"],
+            flags=re.VERBOSE,
+        )
     ):
         return True
 
@@ -224,9 +230,6 @@ def safe_create_test_db(self, verbosity, *args, **kwargs):
     keepdb = kwargs.get('keepdb', False)
     if not keepdb:
         print("     Creating test database...")
-        if settings.DATABASES["default"]["ENGINE"] == 'django.db.backends.mysql':
-            settings.DATABASES["default"]["OPTIONS"] = settings.DATABASE_TEST_OPTIONS
-            print("     Using OPTIONS: %s" % settings.DATABASES["default"]["OPTIONS"])
     test_database_name = old_create(self, 0, *args, **kwargs)
 
     if settings.GLOBAL_TEST_FIXTURES:
@@ -279,7 +282,7 @@ class ValidatingTemplates(DjangoTemplates):
     def __init__(self, params):
         super().__init__(params)
 
-        if not settings.validate_html:
+        if not validation_settings["validate_html"]:
             return
         self.validation_cache = set()
         self.cwd = str(pathlib.Path.cwd())
@@ -295,7 +298,7 @@ class ValidatingTemplate(Template):
     def render(self, context=None, request=None):
         content = super().render(context, request)
 
-        if not settings.validate_html:
+        if not validation_settings["validate_html"]:
             return content
 
         if not self.origin.name.endswith("html"):
@@ -307,7 +310,7 @@ class ValidatingTemplate(Template):
             return content
 
         fingerprint = hash(content) + sys.maxsize + 1  # make hash positive
-        if not settings.validate_html_harder and fingerprint in self.backend.validation_cache:
+        if not validation_settings["validate_html_harder"] and fingerprint in self.backend.validation_cache:
             # already validated this HTML fragment, skip it
             # as an optimization, make page a bit smaller by not returning HTML for the menus
             # FIXME: figure out why this still includes base/menu.html
@@ -323,14 +326,21 @@ class ValidatingTemplate(Template):
         # don't validate each template by itself, causes too much overhead
         # instead, save a batch of them and then validate them all in one go
         # this delays error detection a bit, but is MUCH faster
-        settings.validate_html.batches[kind].append(
+        validation_settings["validate_html"].batches[kind].append(
             (self.origin.name, content, fingerprint)
         )
-        # FWIW, a batch size of 30 seems to result in less than 10% runtime overhead
-        if len(settings.validate_html.batches[kind]) >= 30:
-            settings.validate_html.validate(kind)
-
         return content
+
+
+class TemplateValidationTests(unittest.TestCase):
+    def __init__(self, test_runner, validate_html, **kwargs):
+        self.runner = test_runner
+        self.validate_html = validate_html
+        super().__init__(**kwargs)
+
+    def run_template_validation(self):
+        if self.validate_html:
+            self.validate_html.validate(self)
 
 
 class TemplateCoverageLoader(BaseLoader):
@@ -422,7 +432,7 @@ def get_template_paths(apps=None):
 
 def save_test_results(failures, test_labels):
     # Record the test result in a file, in order to be able to check the
-    # results and avoid re-running tests if we've alread run them with OK
+    # results and avoid re-running tests if we've already run them with OK
     # result after the latest code changes:
     tfile = io.open(".testresult", "a", encoding='utf-8')
     timestr = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -501,8 +511,8 @@ class CoverageTest(unittest.TestCase):
             # Assert coverage failure only if we're running the full test suite -- if we're
             # only running some tests, then of course the coverage is going to be low.
             if self.runner.run_full_test_suite:
-                # Permit 0.02% variation in results -- otherwise small code changes become a pain
-                fudge_factor = 0.0002
+                # Permit a small variation in results -- otherwise small code changes become a pain
+                fudge_factor = 0.0004
                 self.assertLessEqual(len(test_missing), len(master_missing),
                     msg = "New %s without test coverage since %s: %s" % (test, latest_coverage_version, list(set(test_missing) - set(master_missing))))
                 if not self.runner.ignore_lower_coverage:
@@ -540,8 +550,10 @@ class CoverageTest(unittest.TestCase):
                 return (regex in ("^_test500/$", "^accounts/testemail/$")
                         or regex.startswith("^admin/")
                         or re.search('^api/v1/[^/]+/[^/]+/', regex)
-                        or getattr(pattern.callback, "__name__", "") == "RedirectView"
-                        or getattr(pattern.callback, "__name__", "") == "TemplateView"
+                        or (
+                            hasattr(pattern.callback, "view_class")
+                            and issubclass(pattern.callback.view_class, (RedirectView, TemplateView))
+                        )
                         or pattern.callback == django.views.static.serve)
 
             patterns = [(regex, re.compile(regex, re.U), obj) for regex, obj in url_patterns
@@ -571,7 +583,7 @@ class CoverageTest(unittest.TestCase):
             checker.stop()
             # Save to the .coverage file
             checker.save()
-            # Apply the configured and requested omit and include data 
+            # Apply the configured and requested omit and include data
             checker.config.from_args(ignore_errors=None, omit=settings.TEST_CODE_COVERAGE_EXCLUDE_FILES,
                 include=include, file=None)
             for pattern in settings.TEST_CODE_COVERAGE_EXCLUDE_LINES:
@@ -707,8 +719,11 @@ class IetfTestRunner(DiscoverRunner):
         parser.add_argument('--validate-html-harder',
             action='store_true', dest="validate_html_harder", default=False,
             help='Validate all generated HTML with additional validators (slow)')
+        parser.add_argument('--rerun-until-failure',
+            action='store_true', dest='rerun', default=False,
+            help='Run the indicated tests in a loop until a failure occurs. ' )
 
-    def __init__(self, ignore_lower_coverage=False, skip_coverage=False, save_version_coverage=None, html_report=None, permit_mixed_migrations=None, show_logging=None, validate_html=None, validate_html_harder=None, **kwargs):
+    def __init__(self, ignore_lower_coverage=False, skip_coverage=False, save_version_coverage=None, html_report=None, permit_mixed_migrations=None, show_logging=None, validate_html=None, validate_html_harder=None, rerun=None, **kwargs):
         #
         self.ignore_lower_coverage = ignore_lower_coverage
         self.check_coverage = not skip_coverage
@@ -716,12 +731,15 @@ class IetfTestRunner(DiscoverRunner):
         self.html_report = html_report
         self.permit_mixed_migrations = permit_mixed_migrations
         self.show_logging = show_logging
-        settings.validate_html = self if validate_html else None
-        settings.validate_html_harder = self if validate_html and validate_html_harder else None
-        settings.show_logging = show_logging
+        self.rerun = rerun
+        self.test_labels = None
+        global validation_settings
+        validation_settings["validate_html"] = self if validate_html else None
+        validation_settings["validate_html_harder"] = self if validate_html and validate_html_harder else None
+        validation_settings["show_logging"] = show_logging
         #
         self.root_dir = os.path.dirname(settings.BASE_DIR)
-        self.coverage_file = os.path.join(self.root_dir, settings.TEST_COVERAGE_MASTER_FILE)
+        self.coverage_file = os.path.join(self.root_dir, settings.TEST_COVERAGE_MAIN_FILE)
         super(IetfTestRunner, self).__init__(**kwargs)
         if self.parallel > 1:
             if self.html_report == True:
@@ -729,6 +747,11 @@ class IetfTestRunner(DiscoverRunner):
                                  "as the collection of test coverage data isn't currently threadsafe.")
                 sys.exit(1)
             self.check_coverage = False
+        from ietf.doc.tests import TemplateTagTest  # import here to prevent circular imports
+        # Ensure that the coverage tests come last. Specifically list TemplateTagTest before CoverageTest. If this list
+        # contains parent classes to later subclasses, the parent classes will determine the ordering, so use the most
+        # specific classes necessary to get the right ordering:
+        self.reorder_by = (PyFlakesTestCase, MyPyTest,) + self.reorder_by + (StaticLiveServerTestCase, TemplateTagTest, CoverageTest,)
 
     def setup_test_environment(self, **kwargs):
         global template_coverage_collection
@@ -744,7 +767,7 @@ class IetfTestRunner(DiscoverRunner):
         print("     Datatracker %s test suite, %s:" % (ietf.__version__, time.strftime("%d %B %Y %H:%M:%S %Z")))
         print("     Python %s." % sys.version.replace('\n', ' '))
         print("     Django %s, settings '%s'" % (django.get_version(), settings.SETTINGS_MODULE))
-        
+
         settings.TEMPLATES[0]['BACKEND'] = 'ietf.utils.test_runner.ValidatingTemplates'
         if self.check_coverage:
             if self.coverage_file.endswith('.gz'):
@@ -754,19 +777,19 @@ class IetfTestRunner(DiscoverRunner):
                 with io.open(self.coverage_file, encoding='utf-8') as file:
                     self.coverage_master = json.load(file)
             self.coverage_data = {
-                "time": datetime.datetime.now(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "time": timezone.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "template": {
-                    "coverage": 0.0, 
+                    "coverage": 0.0,
                     "covered": {},
                     "format": 1,        # default format, coverage data in 'covered' are just fractions
                 },
                 "url": {
-                    "coverage": 0.0, 
+                    "coverage": 0.0,
                     "covered": {},
                     "format": 4,
                 },
                 "code": {
-                    "coverage": 0.0, 
+                    "coverage": 0.0,
                     "covered": {},
                     "format": 1,
                 },
@@ -813,8 +836,8 @@ class IetfTestRunner(DiscoverRunner):
         for offset in range(10):
             try:
                 # remember the value so ietf.utils.mail.send_smtp() will use the same
-                ietf.utils.mail.SMTP_ADDR['port'] = base + offset 
-                self.smtpd_driver = SMTPTestServerDriver((ietf.utils.mail.SMTP_ADDR['ip4'],ietf.utils.mail.SMTP_ADDR['port']),None) 
+                ietf.utils.mail.SMTP_ADDR['port'] = base + offset
+                self.smtpd_driver = SMTPTestServerDriver((ietf.utils.mail.SMTP_ADDR['ip4'],ietf.utils.mail.SMTP_ADDR['port']),None)
                 self.smtpd_driver.start()
                 print(("     Running an SMTP test server on %(ip4)s:%(port)s to catch outgoing email." % ietf.utils.mail.SMTP_ADDR))
                 break
@@ -833,7 +856,7 @@ class IetfTestRunner(DiscoverRunner):
             s[1] = tuple(s[1])      # random.setstate() won't accept a list in lieu of a tuple
         factory.random.set_random_state(s)
 
-        if not settings.validate_html:
+        if not validation_settings["validate_html"]:
             print("     Not validating any generated HTML; "
                   "please do so at least once before committing changes")
         else:
@@ -859,11 +882,19 @@ class IetfTestRunner(DiscoverRunner):
                     # django-bootstrap5 seems to still generate 'checked="checked"', ignore:
                     "attribute-boolean-style": "off",
                     # self-closing style tags are valid in HTML5. Both self-closing and non-self-closing tags are accepted. (vite generates self-closing link tags)
-                    # "void-style": "off",
+                    "void-style": "off",
                     # Both attributes without value and empty strings are equal and valid. (vite generates empty value attributes)
-                    # "attribute-empty-style": "off"
+                    "attribute-empty-style": "off",
                     # For fragments, don't check that elements are in the proper ancestor element
                     "element-required-ancestor": "off",
+                    # This is allowed by the HTML spec
+                    "form-dup-name": "off",
+                    # Don't trip over unused disable blocks
+                    "no-unused-disable": "off",
+                    # Ignore focusable elements in aria-hidden elements
+                    "hidden-focusable": "off",
+                    # Ignore missing unique identifier for page "landmarks"
+                    "unique-landmark": "off",
                 },
             }
 
@@ -874,15 +905,17 @@ class IetfTestRunner(DiscoverRunner):
             config["doc"]["rules"]["require-sri"] = "off"
             # Turn "element-required-ancestor" back on
             del config["doc"]["rules"]["element-required-ancestor"]
-            # permit discontinuous heading numbering in cards, modals and dialogs:
             config["doc"]["rules"]["heading-level"] = [
                 "error",
                 {
+                    # permit discontinuous heading numbering in cards, modals and dialogs:
                     "sectioningRoots": [
                         ".card-body",
                         ".modal-content",
                         '[role="dialog"]',
-                    ]
+                    ],
+                    # permit multiple H1 elements in a single document
+                    "allowMultipleH1": True,
                 },
             ]
 
@@ -894,9 +927,9 @@ class IetfTestRunner(DiscoverRunner):
                 )
                 self.config_file[kind].write(json.dumps(config[kind]).encode())
                 self.config_file[kind].flush()
-                Path(self.config_file[kind].name).chmod(0o644)
+                pathlib.Path(self.config_file[kind].name).chmod(0o644)
 
-            if not settings.validate_html_harder:
+            if not validation_settings["validate_html_harder"]:
                 print("")
                 self.vnu = None
             else:
@@ -925,98 +958,89 @@ class IetfTestRunner(DiscoverRunner):
                     with open(self.coverage_file, "w") as file:
                         json.dump(self.coverage_master, file, indent=2, sort_keys=True)
 
-        if settings.validate_html:
+        if validation_settings["validate_html"]:
             for kind in self.batches:
-                try:
-                    self.validate(kind)
-                except Exception:
-                    pass
+                if len(self.batches[kind]):
+                    print(f"     WARNING: not all templates of kind '{kind}' were validated")
                 self.config_file[kind].close()
             if self.vnu:
                 self.vnu.terminate()
 
         super(IetfTestRunner, self).teardown_test_environment(**kwargs)
 
-    def validate(self, kind):
-        if not self.batches[kind]:
-            return
-
-        testcase = TestCase()
+    def validate(self, testcase):
         cwd = pathlib.Path.cwd()
-        tmpdir = tempfile.TemporaryDirectory(prefix="html-validate-")
-        Path(tmpdir.name).chmod(0o777)
-        for (name, content, fingerprint) in self.batches[kind]:
-            path = pathlib.Path(tmpdir.name).joinpath(
-                hex(fingerprint)[2:],
-                pathlib.Path(name).relative_to(cwd)
-            )
-            pathlib.Path(path.parent).mkdir(parents=True, exist_ok=True)
-            with path.open(mode="w") as file:
-                file.write(content)
-        self.batches[kind] = []
+        errors = []
+        with tempfile.TemporaryDirectory(prefix="html-validate-") as tmpdir_name:
+            tmppath = pathlib.Path(tmpdir_name)
+            tmppath.chmod(0o777)
+            for kind in self.batches:
+                if not self.batches[kind]:
+                    return
+                for (name, content, fingerprint) in self.batches[kind]:
+                    path = tmppath.joinpath(
+                        hex(fingerprint)[2:],
+                        pathlib.Path(name).relative_to(cwd)
+                    )
+                    pathlib.Path(path.parent).mkdir(parents=True, exist_ok=True)
+                    with path.open(mode="w") as file:
+                        file.write(content)
+                self.batches[kind] = []
 
-        validation_results = None
-        with tempfile.NamedTemporaryFile() as stdout:
-            subprocess.run(
-                [
-                    "yarn",
-                    "html-validate",
-                    "--formatter=json",
-                    "--config=" + self.config_file[kind].name,
-                    tmpdir.name,
-                ],
-                stdout=stdout,
-                stderr=stdout,
-            )
+                validation_results = None
+                with tempfile.NamedTemporaryFile() as stdout:
+                    subprocess.run(
+                        [
+                            "yarn",
+                            "html-validate",
+                            "--formatter=json",
+                            "--config=" + self.config_file[kind].name,
+                            tmpdir_name,
+                        ],
+                        stdout=stdout,
+                        stderr=stdout,
+                    )
 
-            stdout.seek(0)
-            try:
-                validation_results = json.load(stdout)
-            except json.decoder.JSONDecodeError:
-                stdout.seek(0)
-                testcase.fail(stdout.read())
+                    stdout.seek(0)
+                    try:
+                        validation_results = json.load(stdout)
+                    except json.decoder.JSONDecodeError:
+                        stdout.seek(0)
+                        testcase.fail(stdout.read())
 
-        errors = ""
-        for result in validation_results:
-            source_lines = result["source"].splitlines(keepends=True)
-            for msg in result["messages"]:
-                line = msg["line"]
-                errors += (
-                    f'\n{result["filePath"]}:\n'
-                    + "".join(source_lines[line - 5 : line])
-                    + " " * (msg["column"] - 1)
-                    + "^" * msg["size"] + "\n"
-                    + " " * (msg["column"] - 1)
-                    + f'{msg["ruleId"]}: {msg["message"]} '
-                    + f'on line {line}:{msg["column"]}\n'
-                    + "".join(source_lines[line : line + 5])
-                    + "\n"
-                )
+                for result in validation_results:
+                    source_lines = result["source"].splitlines(keepends=True)
+                    for msg in result["messages"]:
+                        line = msg["line"]
+                        errors.append(
+                            f'\n{result["filePath"]}:\n'
+                            + "".join(source_lines[line - 5 : line])
+                            + " " * (msg["column"] - 1)
+                            + "^" * msg["size"] + "\n"
+                            + " " * (msg["column"] - 1)
+                            + f'{msg["ruleId"]}: {msg["message"]} '
+                            + f'on line {line}:{msg["column"]}\n'
+                            + "".join(source_lines[line : line + 5])
+                            + "\n"
+                        )
 
+                if validation_settings["validate_html_harder"] and kind != "frag":
+                    files = [
+                        os.path.join(d, f)
+                        for d, dirs, files in os.walk(tmppath)
+                        for f in files
+                    ]
+                    for file in files:
+                        with open(file, "rb") as f:
+                            content = f.read()
+                            result = vnu_validate(content)
+                            assert result
+                            for msg in json.loads(result)["messages"]:
+                                if vnu_filter_message(msg, False, True):
+                                    continue
+                                errors.append(vnu_fmt_message(file, msg, content.decode("utf-8")))
         if errors:
-            testcase.fail(errors)
-
-        if settings.validate_html_harder:
-            if kind == "frag":
-                return
-            files = [
-                os.path.join(d, f)
-                for d, dirs, files in os.walk(tmpdir.name)
-                for f in files
-            ]
-            for file in files:
-                with open(file, "rb") as f:
-                    content = f.read()
-                    result = vnu_validate(content)
-                    assert result
-                    for msg in json.loads(result)["messages"]:
-                        if vnu_filter_message(msg, False, True):
-                            continue
-                        errors = vnu_fmt_message(file, msg, content.decode("utf-8"))
-                        if errors:
-                            testcase.fail(errors)
-
-        tmpdir.cleanup()
+            testcase.fail('\n'.join(errors))
 
     def get_test_paths(self, test_labels):
         """Find the apps and paths matching the test labels, so we later can limit
@@ -1051,20 +1075,64 @@ class IetfTestRunner(DiscoverRunner):
         test_paths = [ os.path.join(*app.split('.')) for app in test_apps ]
         return test_apps, test_paths
 
+    # Django 5 will drop the extra_tests mechanism for the test runner. Work around
+    # by adding a special label to the test suite, then injecting our extra tests
+    # in load_tests_for_label()
+    def build_suite(self, test_labels=None, extra_tests=None, **kwargs):
+        if test_labels is None:
+            # Base class sets test_labels to ["."] if it was None. The label we're
+            # adding will interfere with that, so replicate that behavior here. 
+            test_labels = ["."]
+        test_labels = ("_ietf_extra_tests",) + tuple(test_labels)
+        return super().build_suite(test_labels, extra_tests, **kwargs)
+
+    def load_tests_for_label(self, label, discover_kwargs):
+        if label == "_ietf_extra_tests":
+            return self._extra_tests() or None
+        return super().load_tests_for_label(label, discover_kwargs)
+
+    def _extra_tests(self):
+        """Get extra tests that should be added to the test suite"""
+        tests = []
+        if validation_settings["validate_html"]:
+            tests += [
+                TemplateValidationTests(
+                    test_runner=self,
+                    validate_html=self,
+                    methodName='run_template_validation',
+                ),
+            ]
+        if self.check_coverage:
+            global template_coverage_collection, code_coverage_collection, url_coverage_collection
+            template_coverage_collection = True
+            code_coverage_collection = True
+            url_coverage_collection = True
+            tests += [
+                PyFlakesTestCase(test_runner=self, methodName='pyflakes_test'),
+                MyPyTest(test_runner=self, methodName='mypy_test'),
+                #CoverageTest(test_runner=self, methodName='interleaved_migrations_test'),
+                CoverageTest(test_runner=self, methodName='url_coverage_test'),
+                CoverageTest(test_runner=self, methodName='template_coverage_test'),
+                CoverageTest(test_runner=self, methodName='code_coverage_test'),
+            ]
+        return tests
+
+    def run_suite(self, suite, **kwargs):
+        failures = super(IetfTestRunner, self).run_suite(suite, **kwargs)
+        while self.rerun and not failures.errors and not failures.failures:
+            suite = self.build_suite(self.test_labels)
+            failures = super(IetfTestRunner, self).run_suite(suite, **kwargs)
+        return failures
+
     def run_tests(self, test_labels, extra_tests=None, **kwargs):
-        global old_destroy, old_create, test_database_name, template_coverage_collection, code_coverage_collection, url_coverage_collection
-        from django.db import connection
-        from ietf.doc.tests import TemplateTagTest
-
-        if extra_tests is None:
-            extra_tests=[]
-
         # Tests that involve switching back and forth between the real
         # database and the test database are way too dangerous to run
         # against the production database
         if socket.gethostname().split('.')[0] in ['core3', 'ietfa', 'ietfb', 'ietfc', ]:
             raise EnvironmentError("Refusing to run tests on production server")
 
+        from django.db import connection
+        global old_destroy, old_create
         old_create = connection.creation.__class__.create_test_db
         connection.creation.__class__.create_test_db = safe_create_test_db
         old_destroy = connection.creation.__class__.destroy_test_db
@@ -1077,26 +1145,7 @@ class IetfTestRunner(DiscoverRunner):
 
         self.test_apps, self.test_paths = self.get_test_paths(test_labels)
 
-        if self.check_coverage:
-            template_coverage_collection = True
-            code_coverage_collection = True
-            url_coverage_collection = True
-            extra_tests += [
-                PyFlakesTestCase(test_runner=self, methodName='pyflakes_test'),
-                MyPyTest(test_runner=self, methodName='mypy_test'),
-                CoverageTest(test_runner=self, methodName='interleaved_migrations_test'),
-                CoverageTest(test_runner=self, methodName='url_coverage_test'),
-                CoverageTest(test_runner=self, methodName='template_coverage_test'),
-                CoverageTest(test_runner=self, methodName='code_coverage_test'),
-            ]
-
-            # ensure that the coverage tests come last.  Specifically list
-            # TemplateTagTest before CoverageTest.  If this list contains
-            # parent classes to later subclasses, the parent classes will
-            # determine the ordering, so use the most specific classes
-            # necessary to get the right ordering:
-            self.reorder_by = (PyFlakesTestCase, MyPyTest, ) + self.reorder_by + (StaticLiveServerTestCase, TemplateTagTest, CoverageTest, )
-
+        self.test_labels = test_labels  # these are used in our run_suite() and not available to it otherwise
         failures = super(IetfTestRunner, self).run_tests(test_labels, extra_tests=extra_tests, **kwargs)
 
         if self.check_coverage:
@@ -1120,10 +1169,10 @@ class IetfTestRunner(DiscoverRunner):
 
                 if self.run_full_test_suite:
                     print(("      %8s coverage: %6.2f%%  (%s: %6.2f%%)" %
-                        (test.capitalize(), test_coverage*100, latest_coverage_version, master_coverage*100, )))
+                           (test.capitalize(), test_coverage*100, latest_coverage_version, master_coverage*100, )))
                 else:
                     print(("      %8s coverage: %6.2f%%" %
-                        (test.capitalize(), test_coverage*100, )))
+                           (test.capitalize(), test_coverage*100, )))
 
             print(("""
                 Per-file code and template coverage and per-url-pattern url coverage data

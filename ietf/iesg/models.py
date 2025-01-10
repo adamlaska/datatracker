@@ -36,7 +36,12 @@
 
 import datetime
 
+from django.conf import settings
 from django.db import models
+
+from ietf.name.models import TelechatAgendaSectionName
+from ietf.utils.timezone import date_today
+
 
 class TelechatAgendaItem(models.Model):
     TYPE_CHOICES = (
@@ -54,29 +59,15 @@ class TelechatAgendaItem(models.Model):
         type_name = self.TYPE_CHOICES_DICT.get(self.type, str(self.type))
         return "%s: %s" % (type_name, self.title or "")
 
-class Telechat(models.Model):
-    telechat_id = models.IntegerField(primary_key=True)
-    telechat_date = models.DateField(null=True, blank=True)
-    minute_approved = models.IntegerField(null=True, blank=True)
-    wg_news_txt = models.TextField(blank=True)
-    iab_news_txt = models.TextField(blank=True)
-    management_issue = models.TextField(blank=True)
-    frozen = models.IntegerField(null=True, blank=True)
-    mi_frozen = models.IntegerField(null=True, blank=True)
-
-    class Meta:
-        db_table = 'telechat'
-
-
 def next_telechat_date():
     dates = TelechatDate.objects.order_by("-date")
     if dates:
         return dates[0].date + datetime.timedelta(days=14)
-    return datetime.date.today()
+    return date_today(settings.TIME_ZONE)
 
 class TelechatDateManager(models.Manager):
     def active(self):
-        return self.get_queryset().filter(date__gte=datetime.date.today())
+        return self.get_queryset().filter(date__gte=date_today(settings.TIME_ZONE))
 
 class TelechatDate(models.Model):
     objects = TelechatDateManager()
@@ -91,3 +82,11 @@ class TelechatDate(models.Model):
         indexes = [
             models.Index(fields=['-date',]),
         ]
+
+
+class TelechatAgendaContent(models.Model):
+    section = models.ForeignKey(TelechatAgendaSectionName, on_delete=models.PROTECT)
+    text = models.TextField(blank=True)
+
+    def __str__(self):
+        return f"{self.section.name} content"
