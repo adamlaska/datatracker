@@ -9,9 +9,12 @@ import json
 import re
 import requests
 
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote as urlquote
+
 from django.conf import settings
+from django.utils import timezone
 from django.utils.encoding import smart_bytes, force_str
-from django.utils.http import urlquote
 
 import debug                            # pyflakes:ignore
 
@@ -21,7 +24,6 @@ from ietf.doc.utils import add_state_change_event
 from ietf.person.models import Person
 from ietf.utils.log import log
 from ietf.utils.mail import parseaddr, get_payload_text
-from ietf.utils.timezone import local_timezone_to_utc, email_time_to_local_timezone, utc_to_local_timezone
 
 
 #PROTOCOLS_URL = "https://www.iana.org/protocols/"
@@ -43,7 +45,7 @@ def update_rfc_log_from_protocol_page(rfc_names, rfc_must_published_later_than):
 
     updated = []
 
-    docs = Document.objects.filter(docalias__name__in=rfc_names).exclude(
+    docs = Document.objects.filter(name__in=rfc_names).exclude(
         docevent__type="rfc_in_iana_registry").filter(
         # only take those that were published after cutoff since we
         # have a big bunch of old RFCs that we unfortunately don't have data for
@@ -64,8 +66,8 @@ def update_rfc_log_from_protocol_page(rfc_names, rfc_must_published_later_than):
     
 
 def fetch_changes_json(url, start, end):
-    url += "?start=%s&end=%s" % (urlquote(local_timezone_to_utc(start).strftime("%Y-%m-%d %H:%M:%S")),
-                                 urlquote(local_timezone_to_utc(end).strftime("%Y-%m-%d %H:%M:%S")))
+    url += "?start=%s&end=%s" % (urlquote(start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+                                 urlquote(end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
     # HTTP basic auth
     username = "ietfsync"
     password = settings.IANA_SYNC_PASSWORD
@@ -159,8 +161,7 @@ def update_history_with_changes(changes, send_email=True):
 
     for c in changes:
         docname = c['doc']
-        timestamp = datetime.datetime.strptime(c["time"], "%Y-%m-%d %H:%M:%S")
-        timestamp = utc_to_local_timezone(timestamp) # timestamps are in UTC
+        timestamp = datetime.datetime.strptime(c["time"], "%Y-%m-%d %H:%M:%S",).replace(tzinfo=datetime.timezone.utc)
 
         if c['type'] in ("iana_state", "iana_review"):
             if c['type'] == "iana_state":
@@ -188,13 +189,13 @@ def update_history_with_changes(changes, send_email=True):
                                              state_type=state_type, state=state)
             if not e:
                 try:
-                    doc = Document.objects.get(docalias__name=docname)
+                    doc = Document.objects.get(name=docname)
                 except Document.DoesNotExist:
                     warnings.append("Document %s not found" % docname)
                     continue
 
                 # the naive way of extracting prev_state here means
-                # that we assume these changes are cronologically
+                # that we assume these changes are chronologically
                 # applied
                 prev_state = doc.get_state(state_type)
                 e = add_state_change_event(doc, system, prev_state, state, timestamp=timestamp)
@@ -241,9 +242,12 @@ def parse_review_email(text):
     doc_name = strip_version_extension(doc_name)
 
     # date
-    review_time = datetime.datetime.now()
+    review_time = timezone.now()
     if "Date" in msg:
-        review_time = email_time_to_local_timezone(msg["Date"])
+        review_time = parsedate_to_datetime(msg["Date"])
+        # parsedate_to_datetime() may return a naive timezone - treat as UTC
+        if review_time.tzinfo is None or review_time.tzinfo.utcoffset(review_time) is None:
+            review_time = review_time.replace(tzinfo=datetime.timezone.utc)
 
     # by
     by = None
@@ -300,3 +304,22 @@ def add_review_comment(doc_name, review_time, by, comment):
         e.by = by
 
         e.save()
+
+
+def ingest_review_email(message: bytes):
+    from ietf.api.views import EmailIngestionError  # avoid circular import
+    try:
+        doc_name, review_time, by, comment = parse_review_email(message)
+    except Exception as err:
+        raise EmailIngestionError("Unable to parse message as IANA review email") from err
+    log(f"Read IANA review email for {doc_name} at {review_time} by {by}")
+    if by.name == "(System)":
+        log("WARNING: person responsible for email does not have a IANA role")  # (sic)
+    try:
+        add_review_comment(doc_name, review_time, by, comment)
+    except Document.DoesNotExist:
+        log(f"ERROR: unknown document {doc_name}")
+        raise EmailIngestionError(f"Unknown document {doc_name}")
+    except Exception as err:
+        raise EmailIngestionError("Error ingesting IANA review email") from err
+    

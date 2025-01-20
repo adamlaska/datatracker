@@ -1,22 +1,26 @@
 # Copyright The IETF Trust 2010-2020, All Rights Reserved
 # -*- coding: utf-8 -*-
-# expiry of Internet Drafts
+# expiry of Internet-Drafts
 
+
+import debug    # pyflakes:ignore
 
 from django.conf import settings
+from django.utils import timezone
 
 import datetime, os, shutil, glob, re
 from pathlib import Path
 
 from typing import List, Optional      # pyflakes:ignore
 
+from ietf.doc.utils import update_action_holders
 from ietf.utils import log
 from ietf.utils.mail import send_mail
-from ietf.doc.models import Document, DocEvent, State, IESG_SUBSTATE_TAGS
+from ietf.doc.models import Document, DocEvent, State
 from ietf.person.models import Person 
 from ietf.meeting.models import Meeting
-from ietf.doc.utils import add_state_change_event, update_action_holders
 from ietf.mailtrigger.utils import gather_address_lists
+from ietf.utils.timezone import date_today, datetime_today, DEADLINE_TZINFO
 
 
 nonexpirable_states: Optional[List[State]] = None
@@ -32,8 +36,8 @@ def expirable_drafts(queryset=None):
 
     # Populate this first time through (but after django has been set up)
     if nonexpirable_states is None:
-        # all IESG states except I-D Exists, AD Watching, and Dead block expiry
-        nonexpirable_states = list(State.objects.filter(used=True, type="draft-iesg").exclude(slug__in=("idexists","watching", "dead")))
+        # all IESG states except I-D Exists and Dead block expiry
+        nonexpirable_states = list(State.objects.filter(used=True, type="draft-iesg").exclude(slug__in=("idexists", "dead")))
         # sent to RFC Editor and RFC Published block expiry (the latter
         # shouldn't be possible for an active draft, though)
         nonexpirable_states += list(State.objects.filter(used=True, type__in=("draft-stream-iab", "draft-stream-irtf", "draft-stream-ise"), slug__in=("rfc-edit", "pub")))
@@ -52,17 +56,17 @@ def expirable_drafts(queryset=None):
 
 
 def get_soon_to_expire_drafts(days_of_warning):
-    start_date = datetime.date.today() - datetime.timedelta(1)
+    start_date = datetime_today(DEADLINE_TZINFO) - datetime.timedelta(1)
     end_date = start_date + datetime.timedelta(days_of_warning)
 
     return expirable_drafts().filter(expires__gte=start_date, expires__lt=end_date)
 
 def get_expired_drafts():
-    return expirable_drafts().filter(expires__lt=datetime.date.today() + datetime.timedelta(1))
+    return expirable_drafts().filter(expires__lt=datetime_today(DEADLINE_TZINFO) + datetime.timedelta(1))
 
 def in_draft_expire_freeze(when=None):
     if when == None:
-        when = datetime.datetime.now()
+        when = timezone.now()
 
     meeting = Meeting.objects.filter(type='ietf', date__gte=when-datetime.timedelta(days=7)).order_by('date').first()
 
@@ -71,10 +75,10 @@ def in_draft_expire_freeze(when=None):
 
     d = meeting.get_second_cut_off()
     # for some reason, the old Perl code started at 9 am
-    second_cut_off = datetime.datetime.combine(d, datetime.time(9, 0))
+    second_cut_off = d.replace(hour=9, minute=0, second=0, microsecond=0)
 
     d = meeting.get_ietf_monday()
-    ietf_monday = datetime.datetime.combine(d, datetime.time(0, 0))
+    ietf_monday = datetime.datetime.combine(d, datetime.time(0, 0), tzinfo=meeting.tz())
 
     return second_cut_off <= when < ietf_monday
 
@@ -84,7 +88,14 @@ def send_expire_warning_for_draft(doc):
         (doc.get_state_slug("draft") != "active")):
         return # don't warn about dead or inactive documents
 
-    expiration = doc.expires.date()
+    expiration = doc.expires.astimezone(DEADLINE_TZINFO).date()
+    now_plus_12hours = timezone.now() + datetime.timedelta(hours=12)
+    soon = now_plus_12hours.date()
+    if expiration <= soon:
+        # The document will expire very soon, which will send email to the
+        # same people, so do not send the warning at this point in time
+        return
+
 
     (to,cc) = gather_address_lists('doc_expires_soon',doc=doc)
 
@@ -130,16 +141,26 @@ def move_draft_files_to_archive(doc, rev):
 
         if os.path.exists(src):
             try:
+                # ghostlinkd would keep this in the combined all archive since it would
+                # be sourced from a different place. But when ghostlinkd is removed, nothing
+                # new is needed here - the file will already exist in the combined archive
                 shutil.move(src, dst)
             except IOError as e:
                 if "No such file or directory" in str(e):
                     pass
                 else:
                     raise
+    
+    def remove_ftp_copy(f):
+        mark = Path(settings.FTP_DIR) / "internet-drafts" / f
+        if mark.exists():
+            mark.unlink()
+
 
     src_dir = Path(settings.INTERNET_DRAFT_PATH)
     for file in src_dir.glob("%s-%s.*" % (doc.name, rev)):
         move_file(str(file.name))
+        remove_ftp_copy(str(file.name))
 
 def expire_draft(doc):
     # clean up files
@@ -149,29 +170,16 @@ def expire_draft(doc):
 
     events = []
 
-    # change the state
-    if doc.latest_event(type='started_iesg_process'):
-        new_state = State.objects.get(used=True, type="draft-iesg", slug="dead")
-        prev_state = doc.get_state(new_state.type_id)
-        prev_tags = doc.tags.filter(slug__in=IESG_SUBSTATE_TAGS)
-        if new_state != prev_state:
-            doc.set_state(new_state)
-            doc.tags.remove(*prev_tags)
-            e = add_state_change_event(doc, system, prev_state, new_state, prev_tags=prev_tags, new_tags=[])
-            if e:
-                events.append(e)
-            e = update_action_holders(doc, prev_state, new_state, prev_tags=prev_tags, new_tags=[])
-            if e:
-                events.append(e)
-
     events.append(DocEvent.objects.create(doc=doc, rev=doc.rev, by=system, type="expired_document", desc="Document has expired"))
 
+    prev_draft_state=doc.get_state("draft")
     doc.set_state(State.objects.get(used=True, type="draft", slug="expired"))
+    events.append(update_action_holders(doc, prev_draft_state, doc.get_state("draft"),[],[]))
     doc.save_with_history(events)
 
 def clean_up_draft_files():
-    """Move unidentified and old files out of the Internet Draft directory."""
-    cut_off = datetime.date.today()
+    """Move unidentified and old files out of the Internet-Draft directory."""
+    cut_off = date_today(DEADLINE_TZINFO)
 
     pattern = os.path.join(settings.INTERNET_DRAFT_PATH, "draft-*.*")
     filename_re = re.compile(r'^(.*)-(\d\d)$')
@@ -204,8 +212,12 @@ def clean_up_draft_files():
             filename, revision = match.groups()
 
         def move_file_to(subdir):
+            # Similar to move_draft_files_to_archive
             shutil.move(path,
                         os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, subdir, basename))
+            mark = Path(settings.FTP_DIR) / "internet-drafts" / basename
+            if mark.exists():
+                mark.unlink()
 
         try:
             doc = Document.objects.get(name=filename, rev=revision)
@@ -214,8 +226,12 @@ def clean_up_draft_files():
 
             if state in ("rfc","repl"):
                 move_file_to("")
-            elif state in ("expired", "auth-rm", "ietf-rm") and doc.expires and doc.expires.date() < cut_off:
+            elif (state in ("expired", "auth-rm", "ietf-rm")
+                  and doc.expires
+                  and doc.expires.astimezone(DEADLINE_TZINFO).date() < cut_off):
                 move_file_to("")
 
         except Document.DoesNotExist:
+            # All uses of this past 2014 seem related to major system failures.
             move_file_to("unknown_ids")
+

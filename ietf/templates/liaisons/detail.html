@@ -11,8 +11,9 @@
     <h1>
         Liaison statement
         <br>
-        <small class="text-muted">{% include 'liaisons/liaison_title.html' %}</small>
+        <small class="text-body-secondary">{% include 'liaisons/liaison_title.html' %}</small>
     </h1>
+    {% include "liaisons/liaison_desc.html" only %}
     {% include "liaisons/detail_tabs.html" %}
     <table class="table table-sm table-striped">
         <tbody>
@@ -87,6 +88,7 @@
                             {% csrf_token %}
                             <button class="btn btn-warning btn-sm"
                                    type="submit"
+                                   value="Mark as action taken"
                                    name="do_action_taken">
                                 Mark as action taken
                             </button>
@@ -229,9 +231,10 @@
             </a>
         {% endif %}
         {% if liaison.state.slug == 'pending' and can_edit %}
-            <button class="btn btn-primary" type="submit" name="approved">Approve</button>
+            <button class="btn btn-primary" type="submit" value="Approve" name="approved">Approve</button>
             <button class="btn btn-primary"
                    type="submit"
+                   value="Mark as Dead"
                    name="dead">Mark as dead</button>
         {% endif %}
         {% if liaison.state.slug == 'posted' and  user|has_role:"Secretariat" %}
@@ -243,6 +246,7 @@
         {% if liaison.state.slug == 'dead' and can_edit %}
             <button class="btn btn-primary"
                    type="submit"
+                   value="Resurrect"
                    name="resurrect">Resurrect</button>
         {% endif %}
     {% if liaison.state.slug == 'pending' and can_edit or liaison.state.slug == 'dead' and can_edit %}</form>{% endif %}

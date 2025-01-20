@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright The IETF Trust 2011-2020, All Rights Reserved
+# Copyright The IETF Trust 2011-2023, All Rights Reserved
 
 
 import datetime
@@ -26,6 +26,8 @@ from ietf.person.models import Person
 from ietf.utils.test_utils import TestCase
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
 from ietf.utils.test_utils import login_testing_unauthorized
+from ietf.utils.timezone import datetime_today, date_today, DEADLINE_TZINFO
+
 
 class ViewCharterTests(TestCase):
     def test_view_revisions(self):
@@ -85,11 +87,12 @@ class ViewCharterTests(TestCase):
 class EditCharterTests(TestCase):
     settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['CHARTER_PATH']
 
+    def setUp(self):
+        super().setUp()
+        (Path(settings.FTP_DIR)/"charter").mkdir()
+
     def write_charter_file(self, charter):
-        with (Path(settings.CHARTER_PATH) /
-              ("%s-%s.txt" % (charter.canonical_name(), charter.rev))
-        ).open("w") as f:
-            f.write("This is a charter.")
+        (Path(settings.CHARTER_PATH) / f"{charter.name}-{charter.rev}.txt").write_text("This is a charter.")
 
     def test_startstop_process(self):
         CharterFactory(group__acronym='mars')
@@ -402,7 +405,7 @@ class EditCharterTests(TestCase):
 
         # Make it so that the charter has been through internal review, and passed its external review
         # ballot on a previous telechat 
-        last_week = datetime.date.today()-datetime.timedelta(days=7)
+        last_week = datetime_today(DEADLINE_TZINFO) - datetime.timedelta(days=7)
         BallotDocEvent.objects.create(type='created_ballot',by=login,doc=charter, rev=charter.rev,
                                       ballot_type=BallotType.objects.get(doc_type=charter.type,slug='r-extrev'),
                                       time=last_week)
@@ -446,8 +449,8 @@ class EditCharterTests(TestCase):
         # Regenerate does not save!
         self.assertEqual(charter.notify,newlist)
         q = PyQuery(r.content)
-        formlist = q('form input[name=notify]')[0].value
-        self.assertEqual(formlist, None)
+        formlist = q('form textarea[name=notify]')[0].value.strip()
+        self.assertEqual(formlist, "")
 
     def test_edit_ad(self):
 
@@ -507,8 +510,16 @@ class EditCharterTests(TestCase):
         self.assertEqual(charter.rev, next_revision(prev_rev))
         self.assertTrue("new_revision" in charter.latest_event().type)
 
-        with (Path(settings.CHARTER_PATH) / (charter.canonical_name() + "-" + charter.rev + ".txt")).open(encoding='utf-8') as f:
-            self.assertEqual(f.read(), "Windows line\nMac line\nUnix line\n" + utf_8_snippet.decode('utf-8'))
+        charter_path = Path(settings.CHARTER_PATH) / (charter.name + "-" + charter.rev + ".txt")
+        file_contents = (charter_path).read_text("utf-8")
+        self.assertEqual(
+            file_contents,
+            "Windows line\nMac line\nUnix line\n" + utf_8_snippet.decode("utf-8"),
+        )
+        ftp_charter_path = Path(settings.FTP_DIR) / "charter" / charter_path.name
+        self.assertTrue(ftp_charter_path.exists())
+        self.assertTrue(charter_path.samefile(ftp_charter_path))
+
 
     def test_submit_initial_charter(self):
         group = GroupFactory(type_id='wg',acronym='mars',list_email='mars-wg@ietf.org')
@@ -535,6 +546,24 @@ class EditCharterTests(TestCase):
 
         group = Group.objects.get(pk=group.pk)
         self.assertEqual(group.charter, charter)
+
+    def test_submit_charter_with_invalid_name(self):
+        self.client.login(username="secretary", password="secretary+password")
+        ietf_group = GroupFactory(type_id="wg")
+        for bad_name in ("charter-irtf-{}", "charter-randomjunk-{}", "charter-ietf-thisisnotagroup"):
+            url = urlreverse("ietf.doc.views_charter.submit", kwargs={"name": bad_name.format(ietf_group.acronym)})
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 404, f"GET of charter named {bad_name} should 404")
+            r = self.client.post(url, {})
+            self.assertEqual(r.status_code, 404, f"POST of charter named {bad_name} should 404")
+
+        irtf_group = GroupFactory(type_id="rg")
+        for bad_name in ("charter-ietf-{}", "charter-whatisthis-{}", "charter-irtf-thisisnotagroup"):
+            url = urlreverse("ietf.doc.views_charter.submit", kwargs={"name": bad_name.format(irtf_group.acronym)})
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 404, f"GET of charter named {bad_name} should 404")
+            r = self.client.post(url, {})
+            self.assertEqual(r.status_code, 404, f"POST of charter named {bad_name} should 404")
 
     def test_edit_review_announcement_text(self):
         area = GroupFactory(type_id='area')
@@ -746,7 +775,7 @@ class EditCharterTests(TestCase):
 
         charter.set_state(State.objects.get(used=True, type="charter", slug="iesgrev"))
 
-        due_date = datetime.date.today() + datetime.timedelta(days=180)
+        due_date = date_today(DEADLINE_TZINFO) + datetime.timedelta(days=180)
         m1 = GroupMilestone.objects.create(group=group,
                                            state_id="active",
                                            desc="Has been copied",
@@ -786,9 +815,11 @@ class EditCharterTests(TestCase):
         self.assertTrue(not charter.ballot_open("approve"))
 
         self.assertEqual(charter.rev, "01")
-        self.assertTrue(
-            (Path(settings.CHARTER_PATH) / ("charter-ietf-%s-%s.txt" % (group.acronym, charter.rev))).exists()
-        )
+        charter_path = Path(settings.CHARTER_PATH) / ("charter-ietf-%s-%s.txt" % (group.acronym, charter.rev))
+        charter_ftp_path = Path(settings.FTP_DIR) / "charter" / charter_path.name
+        self.assertTrue(charter_path.exists())
+        self.assertTrue(charter_ftp_path.exists())
+        self.assertTrue(charter_path.samefile(charter_ftp_path))
 
         self.assertEqual(len(outbox), 2)
         #
@@ -815,6 +846,19 @@ class EditCharterTests(TestCase):
         self.assertEqual(group.groupmilestone_set.filter(state="active", desc=m1.desc).count(), 1)
         self.assertEqual(group.groupmilestone_set.filter(state="active", desc=m4.desc).count(), 1)
 
+    def test_approve_irtf(self):
+        charter = CharterFactory(group__type_id='rg')
+        url = urlreverse('ietf.doc.views_charter.approve', kwargs=dict(name=charter.name))
+        login_testing_unauthorized(self, "secretary", url)
+        empty_outbox()
+        r = self.client.post(url, dict())
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertTrue("IRTF" in outbox[1]['From'])
+        self.assertTrue("irtf-announce" in outbox[1]['To'])
+        self.assertTrue(charter.group.acronym in outbox[1]['Cc'])
+        self.assertTrue("RG Action" in outbox[1]['Subject'])
+
     def test_charter_with_milestones(self):
         charter = CharterFactory()
 
@@ -826,7 +870,7 @@ class EditCharterTests(TestCase):
         m = GroupMilestone.objects.create(group=charter.group,
                                           state_id="active",
                                           desc="Test milestone",
-                                          due=datetime.date.today(),
+                                          due=date_today(DEADLINE_TZINFO),
                                           resolved="")
 
         url = urlreverse('ietf.doc.views_charter.charter_with_milestones_txt', kwargs=dict(name=charter.name, rev=charter.rev))

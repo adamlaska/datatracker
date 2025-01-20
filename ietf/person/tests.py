@@ -4,15 +4,18 @@
 
 import datetime
 import json
+import mock
 
 from io import StringIO, BytesIO
 from PIL import Image
 from pyquery import PyQuery
 
 
+from django.core.exceptions import ValidationError
 from django.http import HttpRequest
 from django.test import override_settings
 from django.urls import reverse as urlreverse
+from django.utils import timezone
 from django.utils.encoding import iri_to_uri
 
 import debug                            # pyflakes:ignore
@@ -23,11 +26,12 @@ from ietf.group.models import Group
 from ietf.nomcom.models import NomCom
 from ietf.nomcom.test_data import nomcom_test_data
 from ietf.nomcom.factories import NomComFactory, NomineeFactory, NominationFactory, FeedbackFactory, PositionFactory
-from ietf.person.factories import EmailFactory, PersonFactory, UserFactory
-from ietf.person.models import Person, Alias
+from ietf.person.factories import EmailFactory, PersonFactory, PersonApiKeyEventFactory
+from ietf.person.models import Person, Alias, PersonApiKeyEvent
+from ietf.person.tasks import purge_personal_api_key_events_task
 from ietf.person.utils import (merge_persons, determine_merge_order, send_merge_notification,
     handle_users, get_extra_primary, dedupe_aliases, move_related_objects, merge_nominees,
-    handle_reviewer_settings, merge_users, get_dots)
+    handle_reviewer_settings, get_dots)
 from ietf.review.models import ReviewerSettings
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized
 from ietf.utils.mail import outbox, empty_outbox
@@ -102,6 +106,48 @@ class PersonTests(TestCase):
         r = self.client.get(photo_url)
         self.assertEqual(r.status_code, 200)
 
+    def test_person_profile_without_email(self):
+        person = PersonFactory(name="foobar@example.com")
+        # delete Email record
+        person.email().delete()
+        url = urlreverse("ietf.person.views.profile", kwargs={ "email_or_name": person.plain_name()})
+        r = self.client.get(url)
+        self.assertContains(r, person.name, status_code=200)
+
+    def test_case_insensitive(self):
+        # Case insensitive seach
+        person = PersonFactory(name="Test Person")
+        url = urlreverse("ietf.person.views.profile", kwargs={ "email_or_name": "test person"})
+        r = self.client.get(url)
+        self.assertContains(r, person.name, status_code=200)
+        self.assertNotIn('More than one person', r.content.decode())
+
+    def test_person_profile_duplicates(self):
+        # same Person name and email - should not show on the profile as multiple Person records
+        person = PersonFactory(name="bazquux@example.com", user__email="bazquux@example.com")
+        url = urlreverse("ietf.person.views.profile", kwargs={ "email_or_name": person.plain_name()})
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn('More than one person', r.content.decode())
+
+        # Change that person's name but leave their email address. Create a new person whose name
+        # is the email address. This *should* be flagged as multiple Person records on the profile.
+        person.name = 'different name'
+        person.save()
+        PersonFactory(name="bazquux@example.com")
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('More than one person', r.content.decode())
+
+    def test_person_profile_404(self):
+        urls = [
+                urlreverse("ietf.person.views.profile", kwargs={ "email_or_name": "nonexistent@example.com"}),
+                urlreverse("ietf.person.views.profile", kwargs={ "email_or_name": "Nonexistent Person"}),]
+
+        for url in urls:
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 404)
+
     def test_person_photo(self):
         person = PersonFactory(with_bio=True)
         
@@ -120,6 +166,14 @@ class PersonTests(TestCase):
         self.assertEqual(r.status_code, 200)
         img = Image.open(BytesIO(r.content))
         self.assertEqual(img.width, 200)
+
+    def test_person_photo_duplicates(self):
+        person = PersonFactory(name="bazquux@example.com", user__username="bazquux@example.com", with_bio=True)
+        PersonFactory(name="bazquux@example.com", user__username="foobar@example.com", with_bio=True)
+
+        url = urlreverse("ietf.person.views.photo", kwargs={ "email_or_name": person.plain_name()})
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 404)
 
     def test_name_methods(self):
         person = PersonFactory(name="Dr. Jens F. Möller", )
@@ -191,6 +245,14 @@ class PersonTests(TestCase):
         p = PersonFactory(with_bio=True)
         self.assertNotIn('cdn-cgi/photo',p.cdn_photo_url())
 
+    def test_invalid_name_characters_rejected(self):
+        for disallowed in "/:@":
+            # build() does not save the new object
+            person_with_bad_name = PersonFactory.build(name=f"I have a {disallowed}", user=None)
+            with self.assertRaises(ValidationError, msg=f"Name with a {disallowed} char should be rejected"):
+                person_with_bad_name.full_clean()  # calls validators (save() does *not*)
+
+
 class PersonUtilsTests(TestCase):
     def test_determine_merge_order(self):
         p1 = get_person_no_user()
@@ -211,7 +273,7 @@ class PersonUtilsTests(TestCase):
         self.assertEqual(results,(p1,p3))
 
         # both have User
-        today = datetime.datetime.today()
+        today = timezone.now()
         p2.user.last_login = today
         p2.user.save()
         p4.user.last_login = today - datetime.timedelta(days=30)
@@ -331,13 +393,24 @@ class PersonUtilsTests(TestCase):
         request.user = user
         source = PersonFactory()
         target = PersonFactory()
+        mars = RoleFactory(name_id='chair',group__acronym='mars').group
         source_id = source.pk
         source_email = source.email_set.first()
         source_alias = source.alias_set.first()
         source_user = source.user
+        communitylist = CommunityList.objects.create(person=source, group=mars)
+        nomcom = NomComFactory()
+        position = PositionFactory(nomcom=nomcom)
+        nominee = NomineeFactory(nomcom=nomcom, person=mars.get_chair().person)
+        feedback = FeedbackFactory(person=source, author=source.email().address, nomcom=nomcom)
+        feedback.nominees.add(nominee)
+        nomination = NominationFactory(nominee=nominee, person=source, position=position, comments=feedback)
         merge_persons(request, source, target, file=StringIO())
         self.assertTrue(source_email in target.email_set.all())
         self.assertTrue(source_alias in target.alias_set.all())
+        self.assertIn(communitylist, target.communitylist_set.all())
+        self.assertIn(feedback, target.feedback_set.all())
+        self.assertIn(nomination, target.nomination_set.all())
         self.assertFalse(Person.objects.filter(id=source_id))
         self.assertFalse(source_user.is_active)
 
@@ -356,24 +429,6 @@ class PersonUtilsTests(TestCase):
         self.assertEqual(target.reviewersettings_set.count(), 1)
         rs = target.reviewersettings_set.first()
         self.assertEqual(rs.min_interval, 7)
-
-    def test_merge_users(self):
-        person = PersonFactory()
-        source = person.user
-        target = UserFactory()
-        mars = RoleFactory(name_id='chair',group__acronym='mars').group
-        communitylist = CommunityList.objects.create(user=source, group=mars)
-        nomcom = NomComFactory()
-        position = PositionFactory(nomcom=nomcom)
-        nominee = NomineeFactory(nomcom=nomcom, person=mars.get_chair().person)
-        feedback = FeedbackFactory(user=source, author=person.email().address, nomcom=nomcom)
-        feedback.nominees.add(nominee)
-        nomination = NominationFactory(nominee=nominee, user=source, position=position, comments=feedback)
-
-        merge_users(source, target)
-        self.assertIn(communitylist, target.communitylist_set.all())
-        self.assertIn(feedback, target.feedback_set.all())
-        self.assertIn(nomination, target.nomination_set.all())
 
     def test_dots(self):
         noroles = PersonFactory()
@@ -397,6 +452,14 @@ class PersonUtilsTests(TestCase):
         self.assertEqual(get_dots(ncchair),['nomcom'])
 
 
-
-
-       
+class TaskTests(TestCase):
+    @mock.patch("ietf.person.tasks.log.log")
+    def test_purge_personal_api_key_events_task(self, mock_log):
+        now = timezone.now()
+        old_event = PersonApiKeyEventFactory(time=now - datetime.timedelta(days=1, minutes=1))
+        young_event = PersonApiKeyEventFactory(time=now - datetime.timedelta(days=1, minutes=-1))
+        purge_personal_api_key_events_task(keep_days=1)
+        self.assertFalse(PersonApiKeyEvent.objects.filter(pk=old_event.pk).exists())
+        self.assertTrue(PersonApiKeyEvent.objects.filter(pk=young_event.pk).exists())
+        self.assertTrue(mock_log.called)
+        self.assertIn("Deleted 1", mock_log.call_args[0][0])

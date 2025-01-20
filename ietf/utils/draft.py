@@ -13,7 +13,7 @@ SYNOPSIS
 
 DESCRIPTION
         Extract information about authors' names and email addresses,
-        intended status and number of pages from Internet Drafts.
+        intended status and number of pages from Internet-Drafts.
         The information is emitted in the form of a line containing
         xml-style attributes, prefixed with the name of the draft.
 
@@ -49,6 +49,9 @@ import sys
 import time
 
 from typing import Dict, List       # pyflakes:ignore
+
+from .timezone import date_today
+
 
 version = "0.35"
 program = os.path.basename(sys.argv[0])
@@ -128,6 +131,24 @@ def acronym_match(s, l):
     #_debug(" s:%s; l:%s => %s; %s" % (s, l, acronym, s==acronym)) 
     return s == acronym
 
+def get_status_from_draft_text(text):
+
+    # Take prefix to shortcut work over very large drafts
+    # 5000 is conservatively much more than a full page of characters and we
+    # only want the first 10 lines.
+    text = text.strip()[:5000] # Take prefix to shortcut work over very large drafts 
+    text = re.sub(".\x08", "", text)    # Get rid of inkribbon backspace-emphasis
+    text = text.replace("\r\n", "\n")   # Convert DOS to unix
+    text = text.replace("\r", "\n")     # Convert MAC to unix
+    lines = text.split("\n")[:10]
+    status = None
+    for line in lines:
+        status_match = re.search(r"^\s*Intended [Ss]tatus:\s*(.*?)   ", line)
+        if status_match:
+            status = status_match.group(1)
+            break
+    return status
+
 class Draft:
     """Base class for drafts
 
@@ -186,7 +207,7 @@ class Draft:
 
     def get_wordcount(self):
         raise NotImplementedError
-
+    
 # ----------------------------------------------------------------------
 
 class PlaintextDraft(Draft):
@@ -200,7 +221,7 @@ class PlaintextDraft(Draft):
         """
         super().__init__()
         assert isinstance(text, str)
-        self.source = source
+        self.source = str(source)
         self.rawtext = text
         self.name_from_source = name_from_source
 
@@ -467,7 +488,7 @@ class PlaintextDraft(Draft):
                         month = int(mon)
                     else:
                         continue
-                    today = datetime.date.today()
+                    today = date_today()
                     if day==0:
                         # if the date was given with only month and year, use
                         # today's date if month and year is today's month and
@@ -529,13 +550,13 @@ class PlaintextDraft(Draft):
                 indent_lines.append(indent)
         percents = {}
         total = float(len(indent_lines))
-        formated = False
+        formatted = False
         for indent in set(indent_lines):
             count = indent_lines.count(indent)/total
             percents[indent] = count
             if count > 0.9:
-                formated = True
-        if not formated:
+                formatted = True
+        if not formatted:
             return abstract
         new_abstract = []
         for line in abstract.split('\n'):
@@ -589,8 +610,8 @@ class PlaintextDraft(Draft):
             "honor" : r"(?:[A-Z]\.|Dr\.?|Dr\.-Ing\.|Prof(?:\.?|essor)|Sir|Lady|Dame|Sri)",
             "prefix": r"([Dd]e|Hadi|van|van de|van der|Ver|von|[Ee]l)",
             "suffix": r"(jr.?|Jr.?|II|2nd|III|3rd|IV|4th)",
-            "first" : r"([A-Z][-A-Za-z'`~]*)(( ?\([A-Z][-A-Za-z'`~]*\))?(\.?[- ]{1,2}[A-Za-z'`~]+)*)",
-            "last"  : r"([-A-Za-z'`~]{2,})",
+            "first" : r"([A-Z][-A-Za-z'`~,]*)(( ?\([A-Z][-A-Za-z'`~,]*\))?(\.?[- ]{1,2}[A-Za-z'`~]+)*)",
+            "last"  : r"([-A-Za-z'`~,]+)",  # single-letter last names exist
             "months": r"(January|February|March|April|May|June|July|August|September|October|November|December)",
             "mabbr" : r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?",
             }
@@ -626,6 +647,8 @@ class PlaintextDraft(Draft):
 
         address_section = r"^ *([0-9]+\.)? *(Author|Editor)('s|s'|s|\(s\)) (Address|Addresses|Information)"
 
+        # "Internet Draft" (without the dash) is correct here, because the usage is to
+        # suppress incorrect author name extraction
         ignore = [
             "Standards Track", "Current Practice", "Internet Draft", "Working Group",
             "Expiration Date", 
@@ -655,7 +678,12 @@ class PlaintextDraft(Draft):
 
             # permit insertion of middle names between first and last, and
             # add possible honorific and suffix information
-            authpat = r"(?:^| and )(?:%(hon)s ?)?(['`]*%(first)s\S*( +[^ ]+)* +%(last)s)( *\(.*|,( [A-Z][-A-Za-z0-9]*)?| %(suffix)s| [A-Z][a-z]+)?" % {"hon":hon, "first":first, "last":last, "suffix":suffix,}
+            if last:
+                authpat = r"(?:^| and )((?:%(hon)s ?)?['`]*%(first)s\S*( +[^ ]+)* +%(last)s(?: %(suffix)s)?)( *\(.*|,( [A-Z][-A-Za-z0-9]*)?| [A-Z][a-z]+)?" % {"hon":hon, "first":first, "last":last, "suffix":suffix,}
+            else:
+                # handle single-word names
+                authpat = r"(?:^| and )((?:%(hon)s ?)?['`]*%(first)s\S*( +[^ ]+)*(?: %(suffix)s)?)( *\(.*|,( [A-Z][-A-Za-z0-9]*)?| [A-Z][a-z]+)?" % {"hon":hon, "first":first, "suffix":suffix,}
+
             return authpat
 
         authors = []
@@ -809,7 +837,7 @@ class PlaintextDraft(Draft):
                 author = author[:-len(suffix)].strip()
             else:
                 suffix = None
-            if "," in author:
+            if ", " in author:
                 last, first = author.split(",",1)
                 author = "%s %s" % (first.strip(), last.strip())
             if not " " in author:
@@ -817,8 +845,9 @@ class PlaintextDraft(Draft):
                     first, last = author.rsplit(".", 1)
                     first += "."
                 else:
-                    author = "[A-Z].+ " + author
-                    first, last = author.rsplit(" ", 1)
+                    # handle single-word names
+                    first = author
+                    last = ""
             else:
                 if "." in author:
                     first, last = author.rsplit(".", 1)
@@ -896,10 +925,14 @@ class PlaintextDraft(Draft):
                                                 #else:
                                                 #    fullname = author_match
                                                 fullname = re.sub(" +", " ", fullname)
-                                                if left == firstname:
-                                                    given_names, surname = fullname.rsplit(None, 1)
+                                                if re.search(r"\s", fullname):
+                                                    if left == firstname:
+                                                        given_names, surname = fullname.rsplit(None, 1)
+                                                    else:
+                                                        surname, given_names = fullname.split(None, 1)
                                                 else:
-                                                    surname, given_names = fullname.split(None, 1)
+                                                    # handle single-word names
+                                                    given_names, surname = (fullname, "")
                                                 if " " in given_names:
                                                     first, middle = given_names.split(None, 1)
                                                 else:
@@ -923,7 +956,7 @@ class PlaintextDraft(Draft):
                                                         companies[i] = None
                                                         break
                                                 else:
-                                                    _warn("Author tuple doesn't match text in draft: %s, %s" % (authors[i], fullname))
+                                                    _warn("Author tuple doesn't match text in Internet-Draft: %s, %s" % (authors[i], fullname))
                                                     authors[i] = None
                                             break
                             except AssertionError:
@@ -1253,7 +1286,7 @@ def getmeta(fn):
     fields["eventsource"] = "draft"
 
     if " " in fn or not fn.endswith(".txt"):
-        _warn("Skipping unexpected draft name: '%s'" % (fn))
+        _warn("Skipping unexpected Internet-Draft name: '%s'" % (fn))
         return {}
 
     if os.path.exists(fn):
@@ -1396,7 +1429,7 @@ def _main(outfile=sys.stdout):
         files = [ "-" ]
 
     for file in files:
-        _debug( "Reading drafts from '%s'" % file)
+        _debug( "Reading Internet-Drafts from '%s'" % file)
         if file == "-":
             file = sys.stdin
         elif file.endswith(".gz"):

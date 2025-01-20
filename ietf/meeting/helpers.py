@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2013-2020, All Rights Reserved
+# Copyright The IETF Trust 2013-2022, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
@@ -17,11 +17,11 @@ from django.contrib.auth.models import AnonymousUser
 from django.urls import reverse
 from django.shortcuts import get_object_or_404
 from django.template.loader import render_to_string
+from django.utils import timezone
 
 import debug                            # pyflakes:ignore
 
 from ietf.doc.models import Document
-from ietf.group.models import Group
 from ietf.group.utils import can_manage_some_groups, can_manage_group
 from ietf.ietfauth.utils import has_role, user_is_person
 from ietf.liaisons.utils import get_person_for_user
@@ -31,18 +31,19 @@ from ietf.meeting.models import Meeting, Schedule, TimeSlot, SchedTimeSessAssign
 from ietf.meeting.utils import session_requested_by, add_event_info_to_session_qs
 from ietf.name.models import ImportantDateName, SessionPurposeName
 from ietf.utils import log, meetecho
-from ietf.utils.history import find_history_replacements_active_at
 from ietf.utils.mail import send_mail
 from ietf.utils.pipe import pipe
 from ietf.utils.text import xslugify
 
 
-def get_meeting(num=None,type_in=['ietf',],days=28):
+def get_meeting(num=None, type_in=('ietf',), days=28):
     meetings = Meeting.objects
-    if type_in:
+    if type_in is not None:
         meetings = meetings.filter(type__in=type_in)
-    if num == None:
-        meetings = meetings.filter(date__gte=datetime.datetime.today()-datetime.timedelta(days=days)).order_by('date')
+    if num is None:
+        meetings = meetings.filter(
+            date__gte=timezone.now() - datetime.timedelta(days=days)
+        ).order_by('date')
     else:
         meetings = meetings.filter(number=num)
     if meetings.exists():
@@ -51,7 +52,7 @@ def get_meeting(num=None,type_in=['ietf',],days=28):
         raise Http404("No such meeting found: %s" % num)
 
 def get_current_ietf_meeting():
-    meetings = Meeting.objects.filter(type='ietf',date__gte=datetime.datetime.today()-datetime.timedelta(days=31)).order_by('date')
+    meetings = Meeting.objects.filter(type='ietf',date__gte=timezone.now()-datetime.timedelta(days=31)).order_by('date')
     return meetings.first()
 
 def get_current_ietf_meeting_num():
@@ -91,10 +92,9 @@ def preprocess_assignments_for_agenda(assignments_queryset, meeting, extra_prefe
     For each assignment a, adds
       a.start_timestamp
       a.end_timestamp
-      a.session.historic_group
-      a.session.historic_parent
       a.session.rescheduled_to (if rescheduled)
       a.session.prefetched_active_materials
+      a.session.order_number
     """
     assignments_queryset = assignments_queryset.prefetch_related(
             'timeslot', 'timeslot__type', 'timeslot__meeting',
@@ -104,7 +104,7 @@ def preprocess_assignments_for_agenda(assignments_queryset, meeting, extra_prefe
                 queryset=add_event_info_to_session_qs(Session.objects.all().prefetch_related(
                     'group', 'group__charter', 'group__charter__group',
                     Prefetch('materials',
-                             queryset=Document.objects.exclude(states__type=F("type"), states__slug='deleted').order_by('sessionpresentation__order').prefetch_related('states'),
+                             queryset=Document.objects.exclude(states__type=F("type"), states__slug='deleted').order_by('presentations__order').prefetch_related('states'),
                              to_attr='prefetched_active_materials'
                     )
                 ))
@@ -117,14 +117,16 @@ def preprocess_assignments_for_agenda(assignments_queryset, meeting, extra_prefe
     # assignments = list(assignments_queryset) # make sure we're set in stone
     assignments = assignments_queryset
 
-    meeting_time = datetime.datetime.combine(meeting.date, datetime.time())
-
     # replace groups with historic counterparts
     groups = [ ]
     for a in assignments:
         if a.session:
-            a.session.historic_group = None
-            a.session.order_number = None
+            # Ensure that all Sessions refer to the same Meeting instance so they can share the
+            # _groups_at_the_time() cache. The Sessions should all belong to the same meeting, but
+            # check before blindly assigning to meeting just in case.
+            if a.session.meeting.pk == meeting.pk:
+                a.session.meeting = meeting
+            a.session.order_number = a.session.order_in_meeting() if a.session.group else None
 
             if a.session.group and a.session.group not in groups:
                 groups.append(a.session.group)
@@ -134,30 +136,9 @@ def preprocess_assignments_for_agenda(assignments_queryset, meeting, extra_prefe
         if a.session and a.session.group:
             sessions_for_groups[(a.session.group, a.session.type_id)].append(a)
 
-    group_replacements = find_history_replacements_active_at(groups, meeting_time)
-
-    parent_id_set = set()
-    for a in assignments:
-        if a.session and a.session.group:
-            a.session.historic_group = group_replacements.get(a.session.group_id)
-
-            if a.session.historic_group:
-                a.session.historic_group.historic_parent = None
-                
-                if a.session.historic_group.parent_id:
-                    parent_id_set.add(a.session.historic_group.parent_id)
-
-            l = sessions_for_groups.get((a.session.group, a.session.type_id), [])
-            a.session.order_number = l.index(a) + 1 if a in l else 0
-
-    parents = Group.objects.filter(pk__in=parent_id_set)
-    parent_replacements = find_history_replacements_active_at(parents, meeting_time)
-
     timeslot_by_session_pk = {a.session_id: a.timeslot for a in assignments}
 
     for a in assignments:
-        if a.session and a.session.historic_group and a.session.historic_group.parent_id:
-            a.session.historic_group.historic_parent = parent_replacements.get(a.session.historic_group.parent_id)
 
         if a.session.current_status == 'resched':
             a.session.rescheduled_to = timeslot_by_session_pk.get(a.session.tombstone_for_id)
@@ -206,12 +187,15 @@ class AgendaKeywordTool:
     @staticmethod
     def _get_group(s):
         """Get group of a session, handling historic groups"""
-        return getattr(s, 'historic_group', s.group)
+        return s.group_at_the_time()
 
     def _get_group_parent(self, s):
         """Get parent of a group or parent of a session's group, handling historic groups"""
-        g = self._get_group(s) if isinstance(s, Session) else s  # accept a group or a session arg
-        return getattr(g, 'historic_parent', g.parent)
+        if isinstance(s, Session):
+            return s.group_parent_at_the_time()
+        else:
+            # Assumption is that s is a group...
+            return s and s.parent
 
     def _purpose_keyword(self, purpose):
         """Get the keyword corresponding to a session purpose"""
@@ -235,8 +219,10 @@ class AgendaFilterOrganizer(AgendaKeywordTool):
 
     Either assignments or sessions must be specified (but not both). Keywords should be applied
     to these items before calling either of the 'get_' methods, otherwise some special filters
-    may not be included (e.g., 'BoF' or 'Plenary'). If historic_group and/or historic_parent
-    attributes are present, these will be used instead of group/parent.
+    may not be included (e.g., 'BoF' or 'Plenary'). If the session's group has a GroupHistory
+    object active at the time of the start of the session's meeting, and/or the session's group
+    parent had an active GroupHistory object active at the time, these will be used instead of 
+    the group or parent.
 
     The organizer will process its inputs once, when one of its get_ methods is first called.
 
@@ -271,6 +257,10 @@ class AgendaFilterOrganizer(AgendaKeywordTool):
         self.special_filters = None
         if self._use_legacy_keywords():
             self.extra_labels += ('Plenary',)  # need this when not using session purpose
+        self.manual_extra_labels = set()
+
+    def add_extra_filter(self, kw):
+        self.manual_extra_labels.add(kw)
 
     def get_non_area_keywords(self):
         """Get list of any 'non-area' (aka 'special') keywords
@@ -327,10 +317,21 @@ class AgendaFilterOrganizer(AgendaKeywordTool):
         groups = set(self._get_group(s) for s in self.sessions
                      if s
                      and self._get_group(s))
-        log.assertion('len(groups) == len(set(g.acronym for g in groups))')  # no repeated acros
+        # Verify that we're not using the same acronym for more than one distinct group, accounting for
+        # the possibility that some groups are GroupHistory instances. This assertion will fail if a Group
+        # and GroupHistory for the same group have a different acronym - in that event, the filter will
+        # not match the meeting display, so we should be alerted that this has actually occurred.
+        log.assertion(
+            "len(set(getattr(g, 'group_id', g.id) for g in groups)) "
+            "== len(set(g.acronym for g in groups))"
+        )
 
         group_parents = set(self._get_group_parent(g) for g in groups if self._get_group_parent(g))
-        log.assertion('len(group_parents) == len(set(gp.acronym for gp in group_parents))')  # no repeated acros
+        # See above for explanation of this assertion
+        log.assertion(
+            "len(set(getattr(gp, 'group_id', gp.id) for gp in group_parents)) "
+            "== len(set(gp.acronym for gp in group_parents))"
+        )
 
         all_groups = groups.union(group_parents)
         all_groups.difference_update([g for g in all_groups if g.acronym in self.exclude_acronyms])
@@ -451,13 +452,13 @@ class AgendaFilterOrganizer(AgendaKeywordTool):
     def _extra_filters(self):
         """Get list of filters corresponding to self.extra_labels"""
         item_source = self.assignments or self.sessions or []
-        candidates = set(self.extra_labels)
+        candidates = set(self.extra_labels).union(self.manual_extra_labels)
         return self._filter_column(
             label=None,
             keyword=None,
             children=[
                 self._filter_entry(label=label, keyword=xslugify(label), toggled_by=[], is_bof=False)
-                for label in candidates if any(
+                for label in candidates if label in self.manual_extra_labels or any(
                     # Keep only those that will affect at least one session
                     [label.lower() in item.filter_keywords for item in item_source]
                 )]
@@ -836,7 +837,7 @@ def get_announcement_initial(meeting, is_change=False):
         desc=desc,
         date=meeting.date,
         change=change)
-    body = render_to_string('meeting/interim_announcement.txt', locals())
+    body = render_to_string('meeting/interim_announcement.txt', locals() | {"settings": settings})
     initial['body'] = body
     return initial
 
@@ -883,13 +884,13 @@ def make_materials_directories(meeting):
     This function takes a meeting object and creates the appropriate materials directories
     '''
     path = meeting.get_materials_path()
-    # Default umask is 0x022, meaning strip write premission for group and others.
+    # Default umask is 0x022, meaning strip write permission for group and others.
     # Change this temporarily to 0x0, to keep write permission for group and others.
     # (WHY??) (Note: this code is old -- was present already when the secretariat code
     # was merged with the regular datatracker code; then in secr/proceedings/views.py
     # in make_directories())
     saved_umask = os.umask(0)   
-    for leaf in ('slides','agenda','minutes','id','rfc','bluesheets'):
+    for leaf in ('slides','agenda','minutes', 'narrativeminutes', 'id','rfc','bluesheets'):
         target = os.path.join(path,leaf)
         if not os.path.exists(target):
             os.makedirs(target)
@@ -1071,8 +1072,7 @@ def sessions_post_save(request, forms):
                 by=request.user.person,
             )
         
-        if ('date' in form.changed_data) or ('time' in form.changed_data):
-            update_interim_session_assignment(form)
+        update_interim_session_assignment(form)
         if 'agenda' in form.changed_data:
             form.save_agenda()
 
@@ -1099,6 +1099,7 @@ def create_interim_session_conferences(sessions):
             try:
                 confs = meetecho_manager.create(
                     group=session.group,
+                    session_id=session.pk,
                     description=str(session),
                     start_time=ts.utc_start_time(),
                     duration=ts.duration,
@@ -1148,26 +1149,33 @@ def sessions_post_cancel(request, sessions):
 
 
 def update_interim_session_assignment(form):
-    """Helper function to create / update timeslot assigned to interim session"""
-    time = datetime.datetime.combine(
-        form.cleaned_data['date'],
-        form.cleaned_data['time'])
+    """Helper function to create / update timeslot assigned to interim session
+
+    form is an InterimSessionModelForm
+
+    Only updates timeslot time (a datetime) and duration
+    """
     session = form.instance
+    meeting = session.meeting
+    time = meeting.tz().localize(
+        datetime.datetime.combine(form.cleaned_data['date'], form.cleaned_data['time'])
+    )
     if session.official_timeslotassignment():
         slot = session.official_timeslotassignment().timeslot
-        slot.time = time
-        slot.duration = session.requested_duration
-        slot.save()
+        if slot.time != time or slot.duration != session.requested_duration:
+            slot.time = time
+            slot.duration = session.requested_duration
+            slot.save()
     else:
         slot = TimeSlot.objects.create(
-            meeting=session.meeting,
+            meeting=meeting,
             type_id='regular',
             duration=session.requested_duration,
             time=time)
         SchedTimeSessAssignment.objects.create(
             timeslot=slot,
             session=session,
-            schedule=session.meeting.schedule)
+            schedule=meeting.schedule)
 
 def populate_important_dates(meeting):
     assert ImportantDate.objects.filter(meeting=meeting).exists() is False

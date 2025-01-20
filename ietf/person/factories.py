@@ -8,14 +8,15 @@ import faker
 import faker.config
 import os
 import random
-import shutil
+from PIL import Image
 
 from unidecode import unidecode
+from unicodedata import normalize
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.utils.text import slugify
-from django.utils.encoding import force_text
+from django.utils.encoding import force_str
 
 import debug                            # pyflakes:ignore
 
@@ -27,10 +28,10 @@ fake = faker.Factory.create()
 
 def setup():
     global acceptable_fakers
-    # The transliteration of some arabic and devanagari names introduces
-    # non-alphabetic characgters that don't work with the draft author
-    # extraction code, and also don't seem to match the way people with arabic
-    # names romanize arabic names.  Exlude those locales from name generation
+    # The transliteration of some Arabic and Devanagari names introduces
+    # non-alphabetic characters that don't work with the draft author
+    # extraction code, and also don't seem to match the way people with Arabic
+    # names romanize Arabic names.  Exclude those locales from name generation
     # in order to avoid test failures.
     locales = set( [ l for l in faker.config.AVAILABLE_LOCALES if not (l.startswith('ar_') or l.startswith('sg_') or l=='fr_QC') ] )
     acceptable_fakers = [faker.Faker(locale) for locale in locales]
@@ -45,25 +46,33 @@ class UserFactory(factory.django.DjangoModelFactory):
         model = User
         django_get_or_create = ('username',)
         exclude = ['faker', ]
+        skip_postgeneration_save = True
 
     faker = factory.LazyFunction(random_faker)
-    first_name = factory.LazyAttribute(lambda o: o.faker.first_name())
-    last_name = factory.LazyAttribute(lambda o: o.faker.last_name())
+    # normalize these i18n Unicode strings in the same way the database does
+    first_name = factory.LazyAttribute(lambda o: normalize("NFKC", o.faker.first_name()))
+    last_name = factory.LazyAttribute(lambda o: normalize("NFKC", o.faker.last_name()))
     email = factory.LazyAttributeSequence(lambda u, n: '%s.%s_%d@%s'%( slugify(unidecode(u.first_name)),
                                                 slugify(unidecode(u.last_name)), n, fake.domain_name())) # type: ignore
     username = factory.LazyAttribute(lambda u: u.email)
 
+    # Consider using PostGenerationMethodCall instead
     @factory.post_generation
     def set_password(obj, create, extracted, **kwargs): # pylint: disable=no-self-argument
         obj.set_password( '%s+password' % obj.username ) # pylint: disable=no-value-for-parameter
+        obj.save()
 
 class PersonFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = Person
+        skip_postgeneration_save = True
 
     user = factory.SubFactory(UserFactory)
     name = factory.LazyAttribute(lambda p: normalize_name('%s %s'%(p.user.first_name, p.user.last_name)))
-    ascii = factory.LazyAttribute(lambda p: force_text(unidecode_name(p.name)))
+    # Some i18n names, e.g., "शिला के.सी." have a dot at the end that is also part of the ASCII, e.g., "Shilaa Kesii."
+    # That trailing dot breaks extract_authors(). Avoid this issue by stripping the dot from the ASCII.
+    # Some others have a trailing semicolon (e.g., "உயிரோவியம் தங்கராஐ;") - strip those, too.
+    ascii = factory.LazyAttribute(lambda p: force_str(unidecode_name(p.name)).rstrip(".;"))
 
     class Params:
         with_bio = factory.Trait(biography = "\n\n".join(fake.paragraphs())) # type: ignore
@@ -94,13 +103,13 @@ class PersonFactory(factory.django.DjangoModelFactory):
             media_name = "%s/%s.jpg" % (settings.PHOTOS_DIRNAME, photo_name)
             obj.photo = media_name
             obj.photo_thumb = media_name
-            photosrc = os.path.join(settings.TEST_DATA_DIR, "profile-default.jpg")
             photodst = os.path.join(settings.PHOTOS_DIR,  photo_name + '.jpg')
-            if not os.path.exists(photodst):
-                shutil.copy(photosrc, photodst)
+            img = Image.new('RGB', (200, 200))
+            img.save(photodst)
             def delete_file(file):
                 os.unlink(file)
             atexit.register(delete_file, photodst)
+            obj.save()
 
 class AliasFactory(factory.django.DjangoModelFactory):
     class Meta:
@@ -149,10 +158,22 @@ class EmailFactory(factory.django.DjangoModelFactory):
 
 class PersonalApiKeyFactory(factory.django.DjangoModelFactory):
     person = factory.SubFactory(PersonFactory)
-    endpoint = FuzzyChoice(PERSON_API_KEY_ENDPOINTS)
-
+    endpoint = FuzzyChoice(v for v, n in PERSON_API_KEY_ENDPOINTS)
+    
     class Meta:
         model = PersonalApiKey
+        skip_postgeneration_save = True
+
+    @factory.post_generation
+    def validate_model(obj, create, extracted, **kwargs):
+        """Validate the model after creation
+        
+        Passing validate_model=False will disable the validation.
+        """
+        do_clean =  True if extracted is None else extracted
+        if do_clean:
+            obj.full_clean()
+
 
 class PersonApiKeyEventFactory(factory.django.DjangoModelFactory):
     key = factory.SubFactory(PersonalApiKeyFactory)

@@ -68,7 +68,7 @@ test.describe('past - desktop', () => {
     const updatedDateTime = DateTime.fromISO(meetingData.meeting.updated)
       .setZone(meetingData.meeting.timezone)
       .setLocale(BROWSER_LOCALE)
-      .toFormat('DD \'at\' tt ZZZZ')
+      .toFormat('DD \'at\' T ZZZZ')
     await expect(page.locator('.agenda h6').first(), 'should have meeting last updated datetime').toContainText(updatedDateTime)
 
     // NAV
@@ -81,9 +81,15 @@ test.describe('past - desktop', () => {
       await expect(navLocator.last()).toContainText('Plaintext')
     })
 
-    // SETTINGS BUTTON
+    // RIGHT-SIDE BUTTONS
 
-    await expect(page.locator('.agenda .meeting-nav + button')).toContainText('Settings')
+    await test.step('has the correct right side buttons', async () => {
+      const btnsLocator = page.locator('.agenda .agenda-topnav-right > button')
+      await expect(btnsLocator).toHaveCount(3)
+      await expect(btnsLocator.first()).toContainText('Help')
+      await expect(btnsLocator.nth(1)).toContainText('Share')
+      await expect(btnsLocator.last()).toContainText('Settings')
+    })
   })
 
   test('agenda schedule list header', async ({ page }) => {
@@ -130,8 +136,9 @@ test.describe('past - desktop', () => {
       const localDateTime = DateTime.fromISO(meetingData.meeting.updated)
         .setZone(BROWSER_TIMEZONE)
         .setLocale(BROWSER_LOCALE)
-        .toFormat('DD \'at\' tt ZZZZ')
+        .toFormat('DD \'at\' T ZZZZ')
       await expect(page.locator('.agenda h6').first()).toContainText(localDateTime)
+      await expect(page.locator('.agenda .agenda-table-display-session-head .agenda-table-cell-name').first()).toContainText('Monday Session I')
       // Switch to UTC
       await tzUtcBtnLocator.click()
       await expect(tzUtcBtnLocator).toHaveClass(/n-button--primary-type/)
@@ -139,13 +146,15 @@ test.describe('past - desktop', () => {
       const utcDateTime = DateTime.fromISO(meetingData.meeting.updated)
         .setZone('utc')
         .setLocale(BROWSER_LOCALE)
-        .toFormat('DD \'at\' tt ZZZZ')
+        .toFormat('DD \'at\' T ZZZZ')
       await expect(page.locator('.agenda h6').first()).toContainText(utcDateTime)
       await expect(page.locator('.agenda .agenda-timezone-ddn')).toContainText('UTC')
+      await expect(page.locator('.agenda .agenda-table-display-session-head .agenda-table-cell-name').first()).toContainText('Monday Session I')
       // Switch back to meeting timezone
       await tzMeetingBtnLocator.click()
       await expect(tzMeetingBtnLocator).toHaveClass(/n-button--primary-type/)
       await expect(page.locator('.agenda .agenda-timezone-ddn')).toContainText('Tokyo')
+      await expect(page.locator('.agenda .agenda-table-display-session-head .agenda-table-cell-name').first()).toContainText('Monday Session I')
     })
   })
 
@@ -207,7 +216,7 @@ test.describe('past - desktop', () => {
           const headerRow = page.locator(`#agenda-rowid-sesshd-${event.id}`)
           await expect(headerRow).toBeVisible()
           await expect(headerRow.locator('.agenda-table-cell-ts')).toContainText(eventTimeSlot)
-          await expect(headerRow.locator('.agenda-table-cell-name')).toContainText(`${DateTime.fromISO(event.startDateTime).toFormat('cccc')} ${event.name}`)
+          await expect(headerRow.locator('.agenda-table-cell-name')).toContainText(`${DateTime.fromISO(event.startDateTime).toFormat('cccc')} ${event.slotName}`)
         }
         // Timeslot
         await expect(row.locator('.agenda-table-cell-ts')).toContainText('—')
@@ -262,7 +271,7 @@ test.describe('past - desktop', () => {
         }
         // Scheduled
         case 'sched': {
-          if (event.flags.showAgenda || ['regular', 'plenary'].includes(event.type)) {
+          if (event.flags.showAgenda || (['regular', 'plenary', 'other'].includes(event.type) && !['admin', 'closed_meeting', 'officehours', 'social'].includes(event.purpose))) {
             const eventButtons = row.locator('.agenda-table-cell-links > .agenda-table-cell-links-buttons')
             if (event.flags.agenda) {
               // Show meeting materials button
@@ -277,10 +286,17 @@ test.describe('past - desktop', () => {
               // No meeting materials yet warning badge
               await expect(eventButtons.locator('.no-meeting-materials')).toBeVisible()
             }
-            // Notepad button
-            const hedgeDocLink = `https://notes.ietf.org/notes-ietf-${meetingData.meeting.number}-${event.type === 'plenary' ? 'plenary' : event.acronym}`
-            await expect(eventButtons.locator(`#btn-lnk-${event.id}-note`)).toHaveAttribute('href', hedgeDocLink)
-            await expect(eventButtons.locator(`#btn-lnk-${event.id}-note > i.bi`)).toBeVisible()
+            if (event.name.toLowerCase().includes('hackathon')) {
+              // Hackathon Wiki button
+              const hackathonWikiLink = `https://wiki.ietf.org/meeting/${meetingData.meeting.number}/hackathon`
+              await expect(eventButtons.locator(`#btn-lnk-${event.id}-wiki`)).toHaveAttribute('href', hackathonWikiLink)
+              await expect(eventButtons.locator(`#btn-lnk-${event.id}-wiki > i.bi`)).toBeVisible()
+            } else {
+              // Notepad button
+              const hedgeDocLink = `https://notes.ietf.org/notes-ietf-${meetingData.meeting.number}-${event.type === 'plenary' ? 'plenary' : event.acronym}`
+              await expect(eventButtons.locator(`#btn-lnk-${event.id}-note`)).toHaveAttribute('href', hedgeDocLink)
+              await expect(eventButtons.locator(`#btn-lnk-${event.id}-note > i.bi`)).toBeVisible()
+            }
             // Chat logs
             await expect(eventButtons.locator(`#btn-lnk-${event.id}-logs`)).toHaveAttribute('href', event.links.chatArchive)
             await expect(eventButtons.locator(`#btn-lnk-${event.id}-logs > i.bi`)).toBeVisible()
@@ -450,14 +466,17 @@ test.describe('past - desktop', () => {
     await expect(page.locator('.agenda-eventdetails .detail-text > iframe')).toHaveAttribute('src', materialsInfo.minutes.url)
     // Footer Buttons
     const hedgeDocLink = `https://notes.ietf.org/notes-ietf-${meetingData.meeting.number}-${event.type === 'plenary' ? 'plenary' : event.acronym}`
+    const detailsUrl = `/meeting/${meetingData.meeting.number}/session/${event.acronym}/`
     const footerBtnsLocator = page.locator('.agenda-eventdetails .detail-action > a')
     await expect(footerBtnsLocator).toHaveCount(4)
     await expect(footerBtnsLocator.first()).toContainText('Download as tarball')
     await expect(footerBtnsLocator.first()).toHaveAttribute('href', `/meeting/${meetingData.meeting.number}/agenda/${event.acronym}-drafts.tgz`)
     await expect(footerBtnsLocator.nth(1)).toContainText('Download as PDF')
     await expect(footerBtnsLocator.nth(1)).toHaveAttribute('href', `/meeting/${meetingData.meeting.number}/agenda/${event.acronym}-drafts.pdf`)
-    await expect(footerBtnsLocator.last()).toContainText('Notepad')
-    await expect(footerBtnsLocator.last()).toHaveAttribute('href', hedgeDocLink)
+    await expect(footerBtnsLocator.nth(2)).toContainText('Notepad')
+    await expect(footerBtnsLocator.nth(2)).toHaveAttribute('href', hedgeDocLink)
+    await expect(footerBtnsLocator.last()).toContainText(`${event.groupAcronym} materials page`)
+    await expect(footerBtnsLocator.last()).toHaveAttribute('href', detailsUrl)
     // Clicking X should close the dialog
     await page.locator('.agenda-eventdetails .n-card-header__extra > .detail-header > button').click()
   })
@@ -685,7 +704,7 @@ test.describe('past - desktop', () => {
     const localDateTime = DateTime.fromISO(meetingData.meeting.updated)
       .setZone(BROWSER_TIMEZONE)
       .setLocale(BROWSER_LOCALE)
-      .toFormat('DD \'at\' tt ZZZZ')
+      .toFormat('DD \'at\' T ZZZZ')
     await expect(page.locator('.agenda h6').first()).toContainText(localDateTime)
     // Switch to UTC
     await tzButtonsLocator.last().click()
@@ -694,7 +713,7 @@ test.describe('past - desktop', () => {
     const utcDateTime = DateTime.fromISO(meetingData.meeting.updated)
       .setZone('utc')
       .setLocale(BROWSER_LOCALE)
-      .toFormat('DD \'at\' tt ZZZZ')
+      .toFormat('DD \'at\' T ZZZZ')
     await expect(page.locator('.agenda h6').first()).toContainText(utcDateTime)
     // Switch back to meeting timezone
     await tzButtonsLocator.first().click()
@@ -770,7 +789,7 @@ test.describe('past - desktop', () => {
 
   test('agenda settings', async ({ page, browserName }) => {
     // Open dialog
-    await page.locator('.meeting-nav + button').click()
+    await page.locator('.agenda-topnav-right > button:last-child').click()
     await expect(page.locator('.agenda-settings')).toBeVisible()
     // Check header elements
     await expect(page.locator('.agenda-settings .n-drawer-header__main > span')).toContainText('Agenda Settings')
@@ -828,7 +847,7 @@ test.describe('past - desktop', () => {
     const localDateTime = DateTime.fromISO(meetingData.meeting.updated)
       .setZone(BROWSER_TIMEZONE)
       .setLocale(BROWSER_LOCALE)
-      .toFormat('DD \'at\' tt ZZZZ')
+      .toFormat('DD \'at\' T ZZZZ')
     await expect(page.locator('.agenda h6').first()).toContainText(localDateTime)
     // Switch to UTC
     await tzUtcBtnLocator.click()
@@ -837,7 +856,7 @@ test.describe('past - desktop', () => {
     const utcDateTime = DateTime.fromISO(meetingData.meeting.updated)
       .setZone('utc')
       .setLocale(BROWSER_LOCALE)
-      .toFormat('DD \'at\' tt ZZZZ')
+      .toFormat('DD \'at\' T ZZZZ')
     await expect(page.locator('.agenda h6').first()).toContainText(utcDateTime)
     // Switch back to meeting timezone
     await tzMeetingBtnLocator.click()
@@ -895,12 +914,28 @@ test.describe('past - desktop', () => {
     await expect(page.locator('.agenda-settings')).not.toBeVisible()
   })
 
+  // -> SHARE DIALOG
+
+  test('agenda share dialog', async ({ page }) => {
+    // Open dialog
+    await page.locator('.agenda-topnav-right > button:nth-child(2)').click()
+    await expect(page.locator('.agenda-share')).toBeVisible()
+    // Check header elements
+    await expect(page.locator('.agenda-share .n-card-header__main > .agenda-share-header > .bi')).toBeVisible()
+    await expect(page.locator('.agenda-share .n-card-header__main > .agenda-share-header > .bi + span')).toContainText('Share this view')
+    // Check input URL
+    await expect(page.locator('.agenda-share .agenda-share-content input[type=text]')).toHaveValue(`http://localhost:3000/meeting/${meetingData.meeting.number}/agenda`)
+    // Clicking X should close the dialog
+    await page.locator('.agenda-share .n-card-header__extra > .agenda-share-header > button').click()
+    await expect(page.locator('.agenda-share')).not.toBeVisible()
+  })
+
   // -> ADD TO CALENDAR
 
   test('agenda add to calendar', async ({ page }) => {
     await expect(page.locator('#agenda-quickaccess-addtocal-btn')).toContainText('Add to your calendar')
     await page.locator('#agenda-quickaccess-addtocal-btn').click()
-    const ddnLocator = page.locator('.n-dropdown-menu > .n-dropdown-option')
+    const ddnLocator = page.locator('.n-dropdown-menu > div > a.agenda-quickaccess-callinks')
     await expect(ddnLocator).toHaveCount(2)
     await expect(ddnLocator.first()).toContainText('Subscribe')
     await expect(ddnLocator.last()).toContainText('Download')
@@ -1009,7 +1044,7 @@ test.describe('past - desktop', () => {
     // Change color legend from settings dialog
     // ----------------------------------------
     // Open dialog
-    await page.locator('.meeting-nav + button').click()
+    await page.locator('.agenda-topnav-right > button:last-child').click()
     await expect(page.locator('.agenda-settings')).toBeVisible()
     // Toggle color legend switch
     await colorLgdSwitchLocator.click()
@@ -1048,7 +1083,7 @@ test.describe('past - desktop', () => {
     // No colored dots should appear
     await expect(page.locator('.agenda .agenda-table-display-event .agenda-table-colorindicator')).toHaveCount(0)
     // Clear all colors from Settings menu
-    await page.locator('.meeting-nav + button').click()
+    await page.locator('.agenda-topnav-right > button:last-child').click()
     await expect(page.locator('.agenda-settings')).toBeVisible()
     await page.locator('.agenda-settings .agenda-settings-actions > button').first().click()
     await page.locator('.n-dropdown-option:has-text("Clear Color")').click()
@@ -1120,7 +1155,7 @@ test.describe('future - desktop', () => {
       // -----------------------
       if (event.status === 'sched') {
         const eventButtons = row.locator('.agenda-table-cell-links > .agenda-table-cell-links-buttons')
-        if (event.flags.showAgenda || ['regular', 'plenary'].includes(event.type)) {
+        if (event.flags.showAgenda || (['regular', 'plenary', 'other'].includes(event.type) && !['admin', 'closed_meeting', 'officehours', 'social'].includes(event.purpose))) {
           if (event.flags.agenda) {
             // Show meeting materials button
             await expect(eventButtons.locator('i.bi.bi-collection')).toBeVisible()
@@ -1134,10 +1169,17 @@ test.describe('future - desktop', () => {
             // No meeting materials yet warning badge
             await expect(eventButtons.locator('.no-meeting-materials')).toBeVisible()
           }
-          // Notepad button
-          const hedgeDocLink = `https://notes.ietf.org/notes-ietf-${meetingData.meeting.number}-${event.type === 'plenary' ? 'plenary' : event.acronym}`
-          await expect(eventButtons.locator(`#btn-lnk-${event.id}-note`)).toHaveAttribute('href', hedgeDocLink)
-          await expect(eventButtons.locator(`#btn-lnk-${event.id}-note > i.bi`)).toBeVisible()
+          if (event.name.toLowerCase().includes('hackathon')) {
+            // Hackathon Wiki button
+            const hackathonWikiLink = `https://wiki.ietf.org/meeting/${meetingData.meeting.number}/hackathon`
+            await expect(eventButtons.locator(`#btn-lnk-${event.id}-wiki`)).toHaveAttribute('href', hackathonWikiLink)
+            await expect(eventButtons.locator(`#btn-lnk-${event.id}-wiki > i.bi`)).toBeVisible()
+          } else {
+            // Notepad button
+            const hedgeDocLink = `https://notes.ietf.org/notes-ietf-${meetingData.meeting.number}-${event.type === 'plenary' ? 'plenary' : event.acronym}`
+            await expect(eventButtons.locator(`#btn-lnk-${event.id}-note`)).toHaveAttribute('href', hedgeDocLink)
+            await expect(eventButtons.locator(`#btn-lnk-${event.id}-note > i.bi`)).toBeVisible()
+          }
           // Chat room
           await expect(eventButtons.locator(`#btn-lnk-${event.id}-room`)).toHaveAttribute('href', event.links.chat)
           await expect(eventButtons.locator(`#btn-lnk-${event.id}-room > i.bi`)).toBeVisible()
@@ -1292,7 +1334,7 @@ test.describe('live - desktop', () => {
 
   test('live red line toggle', async ({ page }) => {
     // Open settings dialog
-    await page.locator('.meeting-nav + button').click()
+    await page.locator('.agenda-topnav-right > button:last-child').click()
     await expect(page.locator('.agenda-settings')).toBeVisible()
     // Toggle red line switch
     const redlineSwitchLocator = page.locator('#agenda-settings-tgl-redline div[role=switch]')
@@ -1399,27 +1441,34 @@ test.describe('past - small screens', () => {
 
         // has a bottom mobile bar
         await expect(page.locator('.agenda-mobile-bar')).toBeVisible()
-        await expect(barBtnLocator).toHaveCount(4)
-        await expect(barBtnLocator.first()).toContainText('Filters')
-        await expect(barBtnLocator.nth(1)).toContainText('Cal')
-        await expect(barBtnLocator.nth(2)).toContainText('.ics')
-        await expect(barBtnLocator.last().locator('> *')).toHaveCount(1)
-        await expect(barBtnLocator.last().locator('> *')).toHaveClass(/bi/)
+        await expect(barBtnLocator).toHaveCount(5)
+
+        // can open the jump to day dropdown
+        await barBtnLocator.first().click()
+        const jumpDayDdnLocator = page.locator('.n-dropdown-menu [data-testid=mobile-link]')
+        await expect(jumpDayDdnLocator).toHaveCount(7)
+        for (let idx = 0; idx < 7; idx++) {
+          const localDateTime = DateTime.fromISO(meetingData.meeting.startDate, { zone: meetingData.meeting.timezone })
+            .setLocale(BROWSER_LOCALE)
+            .plus({ days: idx })
+            .toFormat('ccc LLL d')
+          await expect(jumpDayDdnLocator.nth(idx)).toContainText(`Jump to ${localDateTime}`)
+        }
 
         // can open the filters overlay
-        await barBtnLocator.first().click()
+        await barBtnLocator.nth(1).click()
         await expect(page.locator('.agenda-personalize')).toBeVisible()
         await page.locator('.agenda-personalize .agenda-personalize-actions > button').nth(1).click()
         await expect(page.locator('.agenda-personalize')).toBeHidden()
 
         // can open the calendar view
-        await barBtnLocator.nth(1).click()
+        await barBtnLocator.nth(2).click()
         await expect(page.locator('.agenda-calendar')).toBeVisible()
         await page.locator('.agenda-calendar .agenda-calendar-actions > button').nth(1).click()
         await expect(page.locator('.agenda-calendar')).toBeHidden()
 
         // can open the ics dropdown
-        await barBtnLocator.nth(2).click()
+        await barBtnLocator.nth(3).click()
         const calDdnLocator = page.locator('.n-dropdown-menu > .n-dropdown-option')
         await expect(calDdnLocator).toHaveCount(2)
         await expect(calDdnLocator.first()).toContainText('Subscribe')

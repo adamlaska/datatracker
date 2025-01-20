@@ -34,7 +34,7 @@ indent_size = 2
 [dev/**.js]
 indent_size = 2
 
-[{package.json,.eslintrc.js,.yarnrc.yml,vite.config.js,cypress.config.js}]
+[{package.json,.eslintrc.js,.yarnrc.yml,vite.config.js,jsconfig.json}]
 indent_size = 2
 
 # Settings for cypress tests
@@ -50,3 +50,9 @@ indent_size = 2
 
 [ietf/**.html]
 insert_final_newline = false
+
+# Settings for Kubernetes yaml
+# ---------------------------------------------------------
+# Use 2-space indents
+[k8s/**.yaml]
+indent_size = 2

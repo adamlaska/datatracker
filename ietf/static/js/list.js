@@ -1,16 +1,24 @@
-import * as List from "list.js";
-
-var dummy = new List();
+import {
+    default as List
+} from "list.js";
 
 function text_sort(a, b, options) {
+
+    function prep(e, options) {
+        const el = $($.parseHTML(e.values()[options.valueName]));
+        const cell_el = e.elm.querySelector(`.${options.valueName}`)
+        const sort_by_number = cell_el?.getAttribute('data-sort-number')
+        return sort_by_number ?? el.text()
+            .trim()
+            .replaceAll(/\s+/g, ' ');
+    }
+
     // sort by text content
-    return dummy.utils.naturalSort.caseInsensitive($($.parseHTML(a.values()[options.valueName]))
-        .text()
-        .trim()
-        .replaceAll(/\s+/g, ' '), $($.parseHTML(b.values()[options.valueName]))
-        .text()
-        .trim()
-        .replaceAll(/\s+/g, ' '));
+    return prep(a, options).localeCompare(prep(b, options), "en", {
+        sensitivity: "base",
+        ignorePunctuation: true,
+        numeric: true
+    });
 }
 
 function replace_with_internal(table, internal_table, i) {
@@ -20,15 +28,13 @@ function replace_with_internal(table, internal_table, i) {
         .replaceWith(internal_table[i]
             .children("table")
             .children("tbody")
-            .clone());
+            .clone(true));
 }
 
 function field_magic(i, e, fields) {
-    if ($(e)
-        .attr("colspan") === undefined &&
-        (fields[i] == "num" || fields[i] == "count" ||
-            fields[i] == "percent" || fields[i] == "id" ||
-            fields[i].endsWith("-num") || fields[i].endsWith("-date"))) {
+    if (fields[i] == "num" || fields[i] == "count" ||
+        fields[i] == "percent" || fields[i] == "id" ||
+        fields[i].endsWith("-num") || fields[i].endsWith("-date")) {
         $(e)
             .addClass("text-end");
     }
@@ -62,12 +68,21 @@ $(document)
                 // get field classes from first thead row
                 var fields = $(header_row)
                     .find("th, td")
-                    .map(function () {
-                        return $(this)
-                            .attr("data-sort") ? $(this)
+                    .toArray()
+                    .map((el) => {
+                        let colspan = parseInt($(el)
+                            .attr("colspan")) || 1;
+                        // create a dense (non-sparse) array
+                        let data_sort = new Array();
+                        for (var i = 0; i < colspan; i++) {
+                            data_sort[i] = "";
+                        }
+                        data_sort[0] = $(el)
+                            .attr("data-sort") ? $(el)
                             .attr("data-sort") : "";
+                        return data_sort;
                     })
-                    .toArray();
+                    .flat();
 
                 if (fields.length == 0 || !fields.filter(field => field != "")) {
                     // console.log("No table fields defined, disabling search/sort.");
@@ -79,10 +94,9 @@ $(document)
                 $(header_row)
                     .children("[data-sort]")
                     .addClass("sort");
-                // $(header_row)
-                //     .children("th, td")
-                //     .wrapInner('<span class="tablesorter-th"></span>');
-                //     // .each((i, e) => field_magic(i, e, fields));
+                $(header_row)
+                    .children("th, td")
+                    .each((i, e) => field_magic(i, e, fields));
 
                 if ($(header_row)
                     .text()
@@ -154,10 +168,10 @@ $(document)
                         // create the internal table and add list.js to them
                         var thead = $(this)
                             .siblings("thead:first")
-                            .clone();
+                            .clone(true);
 
                         var tbody = $(this)
-                            .clone();
+                            .clone(true);
 
                         var tbody_rows = $(tbody)
                             .find("tr")
@@ -172,7 +186,7 @@ $(document)
 
                         var parent = $(table)
                             .parent()
-                            .clone();
+                            .clone(true);
 
                         $(parent)
                             .children("table")
@@ -198,12 +212,12 @@ $(document)
                         }
 
                         let newlist = new List(hook, pagination ? {
-                                valueNames: fields,
-                                pagination: pagination,
-                                page: items_per_page
-                            } : {
-                                valueNames: fields
-                            });
+                            valueNames: fields,
+                            pagination: pagination,
+                            page: items_per_page
+                        } : {
+                            valueNames: fields
+                        });
                         // override search module with a patched version
                         // see https://github.com/javve/list.js/issues/699
                         // TODO: check if this is still needed if list.js ever sees an update
@@ -214,7 +228,7 @@ $(document)
                 if (enable_search) {
                     reset_search.on("click", function () {
                         search_field.val("");
-                        $.each(list_instance, (i, e) => {
+                        $.each(list_instance, (_, e) => {
                             e.search();
                         });
                     });
@@ -223,7 +237,7 @@ $(document)
                         if (event.key == "Escape") {
                             reset_search.trigger("click");
                         } else {
-                            $.each(list_instance, (i, e) => {
+                            $.each(list_instance, (_, e) => {
                                 e.search($(this)
                                     .val());
                             });
@@ -236,15 +250,19 @@ $(document)
                     .on("click", function () {
                         var order = $(this)
                             .hasClass("asc") ? "desc" : "asc";
-                        $.each(list_instance, (i, e) => {
+                        $.each(list_instance, (_, e) => {
                             e.sort($(this)
-                                .attr("data-sort"), { order: order, sortFunction: text_sort });
+                                .attr("data-sort"), {
+                                    order: order,
+                                    sortFunction: text_sort
+                                });
                         });
                     });
 
                 $.each(list_instance, (i, e) => {
                     e.on("sortComplete", function () {
                         replace_with_internal(table, internal_table, i);
+                        $(table).find("[data-bs-original-title]").tooltip();
                         if (i == list_instance.length - 1) {
                             $(table)
                                 .find("thead:first tr")
@@ -260,43 +278,35 @@ $(document)
                                 });
                         }
                     });
-
                     e.on("searchComplete", function () {
-                        var last_show_with_children = {};
-                        e.items.forEach((item) => {
-                            if ($(item.elm)
-                                .hasClass("show-with-children")) {
-                                var kind = $(item.elm)
-                                    .attr("class")
-                                    .split(/\s+/)
-                                    .join();
-                                last_show_with_children[kind] = item;
-                            }
-
-                            if (item.found) {
-                                Object.entries(last_show_with_children)
-                                    .forEach(([key, val]) => {
-                                        val.found = true;
-                                        val.show();
-                                        delete last_show_with_children[key];
-                                    });
-                            }
-
-                            if ($(item.elm)
-                                .hasClass("show-always")) {
-                                item.found = true;
-                                item.show();
-                            }
-                        });
-
-                        e.update();
                         replace_with_internal(table, internal_table, i);
                     });
                 });
+
                 $(table.addClass("tablesorter-done"));
                 n++;
                 $(table)[0]
                     .dispatchEvent(new Event("tablesorter:done"));
+
+                // check if there is a sort query argument, and leave the table alone if so
+                const params = new Proxy(new URLSearchParams(window.location.search), {
+                    get: (searchParams, prop) => searchParams.get(prop),
+                });
+                if (!params.sort) {
+                    // else, if there is a data-default-sort attribute on a column, pre-sort the table on that
+                    const presort_col = $(header_row).children("[data-default-sort]:first");
+                    if (presort_col) {
+                        const order = presort_col.attr("data-default-sort");
+                        if (order === "asc" || order === "desc") {
+                            $.each(list_instance, (_, e) => {
+                                e.sort(presort_col.attr("data-sort"), {
+                                    order: order,
+                                    sortFunction: text_sort
+                                });
+                            });
+                        }
+                    }
+                }
             });
 
         // if the URL contains a #, scroll to it again, since we modified the DOM

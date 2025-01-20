@@ -1,13 +1,15 @@
-{# Copyright The IETF Trust 2015, All Rights Reserved #}
+{# Copyright The IETF Trust 2015-2022, All Rights Reserved #}
 {% load origin %}
 {% load static %}
-{% load textfilters %}
+{% load textfilters tz %}
 {% origin %}
-{% with item=session.official_timeslotassignment acronym=session.historic_group.acronym %}
+{% with item=session.official_timeslotassignment acronym=session.group_at_the_time.acronym %}
+    {% if session.agenda and show_agenda %}
+        {# Note: if called with show_agenda=True, calling template must load agenda_materials.js, needed by session_agenda_include.html #}
+        {% include "meeting/session_agenda_include.html" with slug=item.slug session=session timeslot=item.timeslot only %}
+    {% endif %}
     <div role="group" class="btn-group btn-group-sm">
         {% if session.agenda and show_agenda %}
-            {% include "meeting/session_agenda_include.html" with slug=item.slug session=session timeslot=item.timeslot only %}
-            {# Note: if called with show_agenda=True, calling template must load agenda_materials.js, needed by session_agenda_include.html #}
             {# agenda pop-up button #}
             <a class="btn btn-outline-primary"
                data-bs-toggle="modal"
@@ -31,8 +33,8 @@
                 <i class="bi bi-file-pdf"></i>
             </a>
         {% endif %}
-        {# etherpad #}
-        {% if use_codimd %}
+        {# notes #}
+        {% if session.agenda.uses_notes %}
             <a class="btn btn-outline-primary"
                href="{{ session.notes_url }}"
                aria-label="Notepad for note-takers"
@@ -72,9 +74,9 @@
                     <i class="bi bi-people"></i>
                 </a>
                 {# Video stream (meetecho) #}
-            {% elif item.timeslot.location.video_stream_url %}
+            {% elif session.video_stream_url %}
                 <a class="btn btn-outline-primary"
-                   href="{{ item.timeslot.location.video_stream_url|format:session }}"
+                   href="{{ session.video_stream_url|format:session }}"
                    aria-label="Meetecho video stream"
                    title="Meetecho video stream">
                     <i class="bi bi-camera-video"></i>
@@ -90,8 +92,8 @@
             {# iCalendar item #}
             <a class="btn btn-outline-primary"
                href="{% url 'ietf.meeting.views.agenda_ical' num=meeting.number session_id=session.id %}"
-               aria-label="icalendar entry for {{ acronym }} session on {{ item.timeslot.utc_start_time|date:'Y-m-d H:i' }} UTC"
-               title="icalendar entry for {{ acronym }} session on {{ item.timeslot.utc_start_time|date:'Y-m-d H:i' }} UTC">
+               aria-label="icalendar entry for {{ acronym }} session on {{ item.timeslot.time|utc|date:'Y-m-d H:i' }} UTC"
+               title="icalendar entry for {{ acronym }} session on {{ item.timeslot.time|utc|date:'Y-m-d H:i' }} UTC">
                 <i class="bi bi-calendar"></i>
             </a>
         {% else %}
@@ -144,15 +146,16 @@
                             {% endif %}
                         {% endwith %}
                     {% endfor %}
-                {% elif item.timeslot.location.video_stream_url %}
+                {% elif show_empty  %}
+                    {# <i class="bi"></i> #}
+                {% endif %}
+                {% if session.session_recording_url %}
                     <a class="btn btn-outline-primary"
-                       href="http://www.meetecho.com/ietf{{ meeting.number }}/recordings#{{ acronym.upper }}"
+                       href="{{ session.session_recording_url }}"
                        aria-label="Meetecho session recording"
                        title="Meetecho session recording">
                         <i class="bi bi-file-slides"></i>
                     </a>
-                {% elif show_empty  %}
-                    {# <i class="bi"></i> #}
                 {% endif %}
             {% endwith %}
         {% endif %}

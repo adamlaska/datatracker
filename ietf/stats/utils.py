@@ -4,9 +4,10 @@
 
 import re
 import requests
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 from django.conf import settings
+from django.db.models import Q
 
 import debug                            # pyflakes:ignore
 
@@ -269,11 +270,10 @@ def get_meeting_registration_data(meeting):
                 object = meeting_registrations.pop((address, reg_type))
                 created = False
             else:
-                object = MeetingRegistration.objects.create(
+                object, created = MeetingRegistration.objects.get_or_create(
                     meeting_id=meeting.pk,
                     email=address,
                     reg_type=reg_type)
-                created = True
             
             if (object.first_name != first_name[:200] or
                 object.last_name != last_name[:200] or
@@ -320,8 +320,10 @@ def get_meeting_registration_data(meeting):
         raise RuntimeError("Bad response from registrations API: %s, '%s'" % (response.status_code, response.content))
     num_total = MeetingRegistration.objects.filter(
         meeting_id=meeting.pk,
-        attended=True,
-        reg_type__in=['onsite', 'remote']).count()
+        reg_type__in=['onsite', 'remote']
+    ).filter(
+        Q(attended=True) | Q(checkedin=True)
+    ).count()
     if meeting.attendees is None or num_total > meeting.attendees:
         meeting.attendees = num_total
         meeting.save()
@@ -380,3 +382,13 @@ def find_meetingregistration_person_issues(meetings=None):
             summary.no_email.add(f'{mr} ({mr.pk}) provides no email address')
 
     return summary
+
+
+FetchStats = namedtuple("FetchStats", "added processed total")
+
+
+def fetch_attendance_from_meetings(meetings):
+    stats = [
+        FetchStats(*get_meeting_registration_data(meeting)) for meeting in meetings
+    ]
+    return stats

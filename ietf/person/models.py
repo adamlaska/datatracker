@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 
-import datetime
 import email.utils
 import email.header
 import jsonfield
@@ -13,11 +12,13 @@ from urllib.parse import urljoin
 
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.core.exceptions import ObjectDoesNotExist
+from django.contrib.postgres.fields import CICharField
+from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import models
 from django.template.loader import render_to_string
 from django.urls import reverse as urlreverse
+from django.utils import timezone
 from django.utils.encoding import smart_bytes
 from django.utils.text import slugify
 
@@ -35,25 +36,33 @@ from ietf.utils import log
 from ietf.utils.models import ForeignKey, OneToOneField
 
 
+def name_character_validator(value):
+    disallowed = "@:/"
+    found = set(disallowed).intersection(value)
+    if len(found) > 0:
+        raise ValidationError(
+            f"This name cannot contain the characters {', '.join(disallowed)}"
+        )
+
+
 class Person(models.Model):
     history = HistoricalRecords()
     user = OneToOneField(User, blank=True, null=True, on_delete=models.SET_NULL)
-    time = models.DateTimeField(default=datetime.datetime.now)      # When this Person record entered the system
+    time = models.DateTimeField(default=timezone.now)      # When this Person record entered the system
     # The normal unicode form of the name.  This must be
     # set to the same value as the ascii-form if equal.
-    name = models.CharField("Full Name (Unicode)", max_length=255, db_index=True, help_text="Preferred long form of name.")
-    plain = models.CharField("Plain Name correction (Unicode)", max_length=64, default='', blank=True, help_text="Use this if you have a Spanish double surname.  Don't use this for nicknames, and don't use it unless you've actually observed that the datatracker shows your name incorrectly.")
+    name = models.CharField("Full Name (Unicode)", max_length=255, db_index=True, help_text="Preferred long form of name.", validators=[name_character_validator])
+    plain = models.CharField("Plain Name correction (Unicode)", max_length=64, default='', blank=True, help_text="Use this if you have a Spanish double surname.  Don't use this for nicknames, and don't use it unless you've actually observed that the datatracker shows your name incorrectly.", validators=[name_character_validator])
     # The normal ascii-form of the name.
-    ascii = models.CharField("Full Name (ASCII)", max_length=255, help_text="Name as rendered in ASCII (Latin, unaccented) characters.")
+    ascii = models.CharField("Full Name (ASCII)", max_length=255, help_text="Name as rendered in ASCII (Latin, unaccented) characters.", validators=[name_character_validator])
     # The short ascii-form of the name.  Also in alias table if non-null
-    ascii_short = models.CharField("Abbreviated Name (ASCII)", max_length=32, null=True, blank=True, help_text="Example: A. Nonymous.  Fill in this with initials and surname only if taking the initials and surname of the ASCII name above produces an incorrect initials-only form. (Blank is OK).")
+    ascii_short = models.CharField("Abbreviated Name (ASCII)", max_length=32, null=True, blank=True, help_text="Example: A. Nonymous.  Fill in this with initials and surname only if taking the initials and surname of the ASCII name above produces an incorrect initials-only form. (Blank is OK).", validators=[name_character_validator])
     pronouns_selectable = jsonfield.JSONCharField("Pronouns", max_length=120, blank=True, null=True, default=list )
     pronouns_freetext = models.CharField(" ", max_length=30, null=True, blank=True, help_text="Optionally provide your personal pronouns. These will be displayed on your public profile page and alongside your name in Meetecho and, in future, other systems. Select any number of the checkboxes OR provide a custom string up to 30 characters.")
     biography = models.TextField(blank=True, help_text="Short biography for use on leadership pages. Use plain text or reStructuredText markup.")
     photo = models.ImageField(storage=NoLocationMigrationFileSystemStorage(), upload_to=settings.PHOTOS_DIRNAME, blank=True, default=None)
     photo_thumb = models.ImageField(storage=NoLocationMigrationFileSystemStorage(), upload_to=settings.PHOTOS_DIRNAME, blank=True, default=None)
-    name_from_draft = models.CharField("Full Name (from submission)", null=True, max_length=255, editable=False, help_text="Name as found in a draft submission.")
-    consent = models.BooleanField("I hereby give my consent to the use of the personal details I have provided (photo, bio, name, pronouns, email) within the IETF Datatracker", null=True, default=None)
+    name_from_draft = models.CharField("Full Name (from submission)", null=True, max_length=255, editable=False, help_text="Name as found in an Internet-Draft submission.")
 
     def __str__(self):
         return self.plain_name()
@@ -140,6 +149,14 @@ class Person(models.Model):
                 e = self.email_set.filter(active=True).order_by("-time").first()
             self._cached_email = e
         return self._cached_email
+    def email_allowing_inactive(self):
+        if not hasattr(self, "_cached_email_allowing_inactive"):
+            e = self.email()
+            if not e:
+                e = self.email_set.order_by("-time").first()
+            log.assertion(statement="e is not None", note=f"Person {self.pk} has no Email objects")
+            self._cached_email_allowing_inactive = e
+        return self._cached_email_allowing_inactive
     def email_address(self):
         e = self.email()
         if e:
@@ -177,44 +194,37 @@ class Person(models.Model):
 
     def rfcs(self):
         from ietf.doc.models import Document
-        rfcs = list(Document.objects.filter(documentauthor__person=self, type='draft', states__slug='rfc'))
-        rfcs.sort(key=lambda d: d.canonical_name() )
+        rfcs = list(Document.objects.filter(documentauthor__person=self, type='rfc'))
+        rfcs.sort(key=lambda d: d.name )
         return rfcs
 
     def active_drafts(self):
         from ietf.doc.models import Document
-        return Document.objects.filter(documentauthor__person=self, type='draft', states__slug='active').distinct().order_by('-time')
+
+        return (
+            Document.objects.filter(
+                documentauthor__person=self,
+                type="draft",
+                states__type="draft",
+                states__slug="active",
+            )
+            .distinct()
+            .order_by("-time")
+        )
 
     def expired_drafts(self):
         from ietf.doc.models import Document
-        return Document.objects.filter(documentauthor__person=self, type='draft', states__slug__in=['repl', 'expired', 'auth-rm', 'ietf-rm']).distinct().order_by('-time')
 
-    def needs_consent(self):
-        """
-        Returns an empty list or a list of fields which holds information that
-        requires consent to be given.
-        """
-        needs_consent = []
-        if self.name != self.name_from_draft:
-            needs_consent.append("full name")
-        if self.ascii != self.name_from_draft:
-            needs_consent.append("ascii name")
-        if self.biography and not (self.role_set.exists() or self.rolehistory_set.exists()):
-            needs_consent.append("biography")
-        if self.user_id:
-            needs_consent.append("login")
-            try:
-                if self.user.communitylist_set.exists():
-                    needs_consent.append("draft notification subscription(s)")
-            except ObjectDoesNotExist:
-                pass
-        for email in self.email_set.all():
-            if not email.origin.split(':')[0] in ['author', 'role', 'reviewer', 'liaison', 'shepherd', ]:
-                needs_consent.append("email address(es)")
-                break
-        if self.pronouns_freetext or self.pronouns_selectable:
-            needs_consent.append("pronouns")
-        return needs_consent
+        return (
+            Document.objects.filter(
+                documentauthor__person=self,
+                type="draft",
+                states__type="draft",
+                states__slug__in=["repl", "expired", "auth-rm", "ietf-rm"],
+            )
+            .distinct()
+            .order_by("-time")
+        )
 
     def save(self, *args, **kwargs):
         created = not self.pk
@@ -262,7 +272,7 @@ class Person(models.Model):
 
 
 class PersonExtResource(models.Model):
-    person = ForeignKey(Person) 
+    person = ForeignKey(Person)
     name = models.ForeignKey(ExtResourceName, on_delete=models.CASCADE)
     display_name = models.CharField(max_length=255, default='', blank=True)
     value = models.CharField(max_length=2083) # 2083 is the maximum legal URL length
@@ -299,11 +309,11 @@ class Alias(models.Model):
 
 class Email(models.Model):
     history = HistoricalRecords()
-    address = models.CharField(max_length=64, primary_key=True, validators=[validate_email])
+    address = CICharField(max_length=64, primary_key=True, validators=[validate_email])
     person = ForeignKey(Person, null=True)
     time = models.DateTimeField(auto_now_add=True)
     primary = models.BooleanField(default=False)
-    origin = models.CharField(max_length=150, blank=False, help_text="The origin of the address: the user's email address, or 'author: DRAFTNAME' if a draft, or 'role: GROUP/ROLE' if a role.")       # User.username or Document.name
+    origin = models.CharField(max_length=150, blank=False, help_text="The origin of the address: the user's email address, or 'author: DRAFTNAME' if an Internet-Draft, or 'role: GROUP/ROLE' if a role.")       # User.username or Document.name
     active = models.BooleanField(default=True)      # Old email addresses are *not* purged, as history
                                                     # information points to persons through these
 
@@ -366,9 +376,12 @@ PERSON_API_KEY_VALUES = [
     ("/api/iesg/position", "/api/iesg/position", "Area Director"),
     ("/api/v2/person/person", "/api/v2/person/person", "Robot"),
     ("/api/meeting/session/video/url", "/api/meeting/session/video/url", "Recording Manager"),
-    ("/api/notify/meeting/registration", "/api/notify/meeting/registration", "Robot"), 
+    ("/api/meeting/session/recording-name", "/api/meeting/session/recording-name", "Recording Manager"),
+    ("/api/notify/meeting/registration", "/api/notify/meeting/registration", "Robot"),
     ("/api/notify/meeting/bluesheet", "/api/notify/meeting/bluesheet", "Recording Manager"),
-    ("/api/notify/session/attendees", "/api/notify/session/attendees", "Recording Manager"), 
+    ("/api/notify/session/attendees", "/api/notify/session/attendees", "Recording Manager"),
+    ("/api/notify/session/chatlog", "/api/notify/session/chatlog", "Recording Manager"),
+    ("/api/notify/session/polls", "/api/notify/session/polls", "Recording Manager"),
     ("/api/appauth/authortools", "/api/appauth/authortools", None),
     ("/api/appauth/bibxml", "/api/appauth/bibxml", None),
 ]
@@ -377,7 +390,7 @@ PERSON_API_KEY_ENDPOINTS = sorted(list(set([ (v, n) for (v, n, r) in PERSON_API_
 class PersonalApiKey(models.Model):
     person   = ForeignKey(Person, related_name='apikeys')
     endpoint = models.CharField(max_length=128, null=False, blank=False, choices=PERSON_API_KEY_ENDPOINTS)
-    created  = models.DateTimeField(default=datetime.datetime.now, null=False)
+    created  = models.DateTimeField(default=timezone.now, null=False)
     valid    = models.BooleanField(default=True)
     salt     = models.BinaryField(default=salt, max_length=12, null=False, blank=False)
     count    = models.IntegerField(default=0, null=False, blank=False)
@@ -421,13 +434,12 @@ class PersonalApiKey(models.Model):
 
 PERSON_EVENT_CHOICES = [
     ("apikey_login", "API key login"),
-    ("gdpr_notice_email", "GDPR consent request email sent"),
     ("email_address_deactivated", "Email address deactivated"),
     ]
 
 class PersonEvent(models.Model):
     person = ForeignKey(Person)
-    time = models.DateTimeField(default=datetime.datetime.now, help_text="When the event happened")
+    time = models.DateTimeField(default=timezone.now, help_text="When the event happened")
     type = models.CharField(max_length=50, choices=PERSON_EVENT_CHOICES)
     desc = models.TextField()
 
@@ -442,4 +454,4 @@ class PersonEvent(models.Model):
 
 class PersonApiKeyEvent(PersonEvent):
     key = ForeignKey(PersonalApiKey)
-    
+

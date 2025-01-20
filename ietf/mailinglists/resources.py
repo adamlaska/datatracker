@@ -11,17 +11,17 @@ from tastypie.cache import SimpleCache
 from ietf import api
 from ietf.api import ToOneField                         # pyflakes:ignore
 
-from ietf.mailinglists.models import Whitelisted, List, Subscribed
+from ietf.mailinglists.models import Allowlisted, NonWgMailingList
 
 
 from ietf.person.resources import PersonResource
-class WhitelistedResource(ModelResource):
+class AllowlistedResource(ModelResource):
     by               = ToOneField(PersonResource, 'by')
     class Meta:
-        queryset = Whitelisted.objects.all()
+        queryset = Allowlisted.objects.all()
         serializer = api.Serializer()
         cache = SimpleCache()
-        #resource_name = 'whitelisted'
+        #resource_name = 'allowlisted'
         ordering = ['id', ]
         filtering = { 
             "id": ALL,
@@ -29,36 +29,22 @@ class WhitelistedResource(ModelResource):
             "email": ALL,
             "by": ALL_WITH_RELATIONS,
         }
-api.mailinglists.register(WhitelistedResource())
+api.mailinglists.register(AllowlistedResource())
 
-class ListResource(ModelResource):
+class NonWgMailingListResource(ModelResource):
     class Meta:
-        queryset = List.objects.all()
+        queryset = NonWgMailingList.objects.all()
         serializer = api.Serializer()
         cache = SimpleCache()
-        #resource_name = 'list'
+        #resource_name = 'nonwgmailinglist'
         ordering = ['id', ]
         filtering = { 
             "id": ALL,
             "name": ALL,
+            "domain": ALL,
             "description": ALL,
-            "advertised": ALL,
         }
-api.mailinglists.register(ListResource())
+api.mailinglists.register(NonWgMailingListResource())
 
-class SubscribedResource(ModelResource):
-    lists            = ToManyField(ListResource, 'lists', null=True)
-    class Meta:
-        queryset = Subscribed.objects.all()
-        serializer = api.Serializer()
-        cache = SimpleCache()
-        #resource_name = 'subscribed'
-        ordering = ['id', ]
-        filtering = { 
-            "id": ALL,
-            "time": ALL,
-            "email": ALL,
-            "lists": ALL_WITH_RELATIONS,
-        }
-api.mailinglists.register(SubscribedResource())
+
 
