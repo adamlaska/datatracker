@@ -93,3 +93,4 @@ xml2rfc>=3.30.0
 xym>=0.6,<0.10.0
 zxcvbn>=4.5.0
 types-zxcvbn~=4.5.0.20260518  # match zxcvbn version
+cryptography>=49.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
